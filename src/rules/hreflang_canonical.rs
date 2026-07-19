@@ -1,5 +1,6 @@
 use crate::model::snapshot::Snapshot;
 use crate::rules::registry::{Evidence, Finding, Rule, Severity};
+use crate::scanner::html_signals::normalize_url_key;
 
 /// CC-HREFLANG-CANONICAL-001: Hreflang URL differs from target's own canonical.
 pub struct HreflangCanonicalRule;
@@ -18,13 +19,8 @@ impl Rule for HreflangCanonicalRule {
             }
 
             for entry in &state.hreflang {
-                // Self-reference is fine
-                if entry.url == state.url {
-                    continue;
-                }
-
                 // Check if the hreflang target's canonical matches the hreflang URL
-                let target_key = entry.url.to_string();
+                let target_key = normalize_url_key(&entry.url);
                 if let Some(target_state) = snapshot.urls.get(&target_key) {
                     if let Some(ref target_canonical) = target_state.effective_canonical {
                         if target_canonical != &entry.url {
@@ -141,5 +137,22 @@ mod tests {
         let snapshot = make_snapshot(urls);
         let findings = HreflangCanonicalRule.evaluate(&snapshot);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn self_hreflang_must_match_the_pages_canonical() {
+        let mut urls = BTreeMap::new();
+        let page = Url::parse("https://example.test/en/page").unwrap();
+        let canonical = Url::parse("https://example.test/en/other").unwrap();
+        let mut state = UrlState::new(page.clone());
+        state.hreflang = vec![HreflangEntry {
+            lang: "en".to_string(),
+            url: page.clone(),
+        }];
+        state.effective_canonical = Some(canonical);
+        urls.insert(page.to_string(), state);
+
+        let findings = HreflangCanonicalRule.evaluate(&make_snapshot(urls));
+        assert_eq!(findings.len(), 1);
     }
 }

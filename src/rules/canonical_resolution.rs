@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::model::snapshot::Snapshot;
 use crate::rules::registry::{Evidence, Finding, Rule, Severity};
+use crate::scanner::html_signals::normalize_url_key;
 
 /// CC-CANONICAL-RESOLUTION-001: Canonical chain exceeds depth 1.
 /// CC-CANONICAL-RESOLUTION-002: Canonical cycle detected.
@@ -22,7 +23,7 @@ impl Rule for CanonicalResolutionRule {
             .map(|(key, state)| {
                 (
                     key.clone(),
-                    state.effective_canonical.as_ref().map(|u| u.to_string()),
+                    state.effective_canonical.as_ref().map(normalize_url_key),
                 )
             })
             .collect();
@@ -69,21 +70,29 @@ impl Rule for CanonicalResolutionRule {
                 // Check if this target has its own canonical
                 match canonical_graph.get(&current) {
                     Some(Some(next)) if next != &current => {
-                        if chain.len() > 2 {
-                            // Chain exceeds depth 1 (A → B → C)
+                        if visited.contains(next) {
+                            current = next.clone();
+                            continue;
+                        }
+                        if chain.len() >= 2 {
+                            let mut reported_chain = chain.clone();
+                            reported_chain.push(next.clone());
                             findings.push(Finding {
                                 rule_id: "CC-CANONICAL-RESOLUTION-001".to_string(),
                                 severity: Severity::Error,
                                 url: url.clone(),
                                 message: format!(
                                     "Canonical chain exceeds depth 1: {}",
-                                    chain.join(" → ")
+                                    reported_chain.join(" → ")
                                 ),
                                 evidence: Evidence {
                                     declared: None,
                                     observed: None,
-                                    canonical: Some(chain.join(" → ")),
-                                    detail: Some(format!("Chain length: {}", chain.len() - 1)),
+                                    canonical: Some(reported_chain.join(" → ")),
+                                    detail: Some(format!(
+                                        "Chain length: {}",
+                                        reported_chain.len() - 1
+                                    )),
                                 },
                             });
                             break;

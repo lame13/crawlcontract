@@ -8,7 +8,9 @@ use crate::model::robots::RobotsDirective;
 use crate::model::url_state::{UrlSource, UrlState};
 use crate::signals::canonical::extract_html_canonical;
 use crate::signals::hreflang::extract_hreflang;
-use crate::signals::internal_links::{count_headings, count_words, extract_internal_links};
+use crate::signals::internal_links::{
+    count_headings, count_words, extract_internal_links, extract_internal_links_with_alias,
+};
 use crate::signals::robots_directive::extract_meta_robots;
 
 /// All signals extracted from a single HTML document.
@@ -24,11 +26,23 @@ pub struct HtmlSignals {
 
 /// Extract all HTML signals from a parsed document.
 pub fn extract_html_signals(document: &Html, base_url: &Url) -> HtmlSignals {
+    extract_html_signals_with_alias(document, base_url, None)
+}
+
+pub fn extract_html_signals_with_alias(
+    document: &Html,
+    base_url: &Url,
+    crawl_origin: Option<&Url>,
+) -> HtmlSignals {
     HtmlSignals {
         canonical: extract_html_canonical(document, base_url),
         meta_robots: extract_meta_robots(document),
         hreflang: extract_hreflang(document, base_url),
-        internal_links: extract_internal_links(document, base_url),
+        internal_links: if crawl_origin.is_some() {
+            extract_internal_links_with_alias(document, base_url, crawl_origin)
+        } else {
+            extract_internal_links(document, base_url)
+        },
         word_count: count_words(document),
         heading_count: count_headings(document),
     }
@@ -58,26 +72,38 @@ pub fn process_html_files(html_files: &[(Url, String)], states: &mut BTreeMap<St
             s
         });
 
+        state.add_source(UrlSource::DirectScan);
+        state.http_status = Some(200);
         apply_html_signals(state, &signals);
+
+        if let Some(canonical) = &signals.canonical {
+            let canonical_key = normalize_url_key(canonical);
+            let canonical_state = states
+                .entry(canonical_key)
+                .or_insert_with(|| UrlState::new(canonical.clone()));
+            canonical_state.add_source(UrlSource::Canonical);
+        }
 
         // Register discovered hreflang URLs
         for entry in &signals.hreflang {
             let href_key = normalize_url_key(&entry.url);
-            states.entry(href_key).or_insert_with(|| {
+            let state = states.entry(href_key).or_insert_with(|| {
                 let mut s = UrlState::new(entry.url.clone());
                 s.add_source(UrlSource::Hreflang);
                 s
             });
+            state.add_source(UrlSource::Hreflang);
         }
 
         // Register discovered internal link targets
         for link_url in &signals.internal_links {
             let link_key = normalize_url_key(link_url);
-            states.entry(link_key).or_insert_with(|| {
+            let state = states.entry(link_key).or_insert_with(|| {
                 let mut s = UrlState::new(link_url.clone());
                 s.add_source(UrlSource::InternalLink);
                 s
             });
+            state.add_source(UrlSource::InternalLink);
         }
     }
 }

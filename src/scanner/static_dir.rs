@@ -4,16 +4,18 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use url::Url;
 
+use crate::graph::reachability::compute_reachability;
+use crate::graph::state::compute_derived_state;
 use crate::model::snapshot::{utc_now, Snapshot, Statistics};
-use crate::model::url_state::{RobotsTxtStatus, UrlSource, UrlState};
+use crate::model::url_state::{UrlSource, UrlState};
 use crate::scanner::html_signals::{normalize_url_key, process_html_files};
-use crate::signals::sitemap::{collect_sitemap_urls, parse_sitemap, Sitemap};
+use crate::signals::sitemap::{collect_sitemap_urls, parse_sitemap};
 
 /// Result of scanning a static directory.
 pub struct StaticScanResult {
     pub html_files: Vec<(Url, String)>,
     pub robots_txt_body: Option<String>,
-    pub sitemap_body: Option<String>,
+    pub sitemap_files: Vec<(PathBuf, String)>,
     pub base_url: Url,
 }
 
@@ -21,7 +23,7 @@ pub struct StaticScanResult {
 pub fn discover_files(dist_path: &Path, base_url: &Url) -> anyhow::Result<StaticScanResult> {
     let mut html_files = Vec::new();
     let mut robots_txt_body = None;
-    let mut sitemap_body = None;
+    let mut sitemap_files = Vec::new();
 
     let entries = walk_dir(dist_path)?;
 
@@ -45,10 +47,11 @@ pub fn discover_files(dist_path: &Path, base_url: &Url) -> anyhow::Result<Static
             || relative_str.starts_with("sitemap-")
             || relative_str.ends_with("-sitemap.xml")
         {
-            sitemap_body = Some(
+            sitemap_files.push((
+                relative.to_path_buf(),
                 std::fs::read_to_string(&entry_path)
                     .with_context(|| format!("reading {}", entry_path.display()))?,
-            );
+            ));
             continue;
         }
 
@@ -64,13 +67,16 @@ pub fn discover_files(dist_path: &Path, base_url: &Url) -> anyhow::Result<Static
     Ok(StaticScanResult {
         html_files,
         robots_txt_body,
-        sitemap_body,
+        sitemap_files,
         base_url: base_url.clone(),
     })
 }
 
 /// Build a complete scan result into a Snapshot.
-pub fn build_snapshot(result: StaticScanResult, public_origin: Option<Url>) -> Snapshot {
+pub fn build_snapshot(
+    result: StaticScanResult,
+    public_origin: Option<Url>,
+) -> anyhow::Result<Snapshot> {
     let base_url = result.base_url.clone();
     let mut states: BTreeMap<String, UrlState> = BTreeMap::new();
 
@@ -81,30 +87,12 @@ pub fn build_snapshot(result: StaticScanResult, public_origin: Option<Url>) -> S
         .map(|body| crate::signals::robots_txt::RobotsTxt::parse(body, &base_url));
 
     // 2. Process sitemap
-    let sitemap_urls = if let Some(body) = &result.sitemap_body {
-        match parse_sitemap(body) {
-            Ok(sitemap) => {
-                let urls = collect_sitemap_urls(&sitemap);
-                // If it's an index, we can't resolve child sitemaps in static mode,
-                // so we record what we have.
-                if let Sitemap::Index(idx) = &sitemap {
-                    for child_url in &idx.sitemaps {
-                        let key = normalize_url_key(child_url);
-                        // Mark child sitemaps as discovered but note they're indexes
-                        states.entry(key).or_insert_with(|| {
-                            let mut s = UrlState::new(child_url.clone());
-                            s.add_source(UrlSource::Sitemap);
-                            s
-                        });
-                    }
-                }
-                urls
-            }
-            Err(_) => BTreeSet::new(),
-        }
-    } else {
-        BTreeSet::new()
-    };
+    let mut sitemap_urls = BTreeSet::new();
+    for (path, body) in &result.sitemap_files {
+        let sitemap =
+            parse_sitemap(body).with_context(|| format!("parsing sitemap {}", path.display()))?;
+        sitemap_urls.extend(collect_sitemap_urls(&sitemap));
+    }
 
     // 3. Mark sitemap URLs in states
     for url in &sitemap_urls {
@@ -123,19 +111,19 @@ pub fn build_snapshot(result: StaticScanResult, public_origin: Option<Url>) -> S
     // 5. Apply robots.txt status
     for state in states.values_mut() {
         if let Some(rt) = &robots_txt {
-            state.robots_txt_status = rt.is_allowed(state.url.path());
+            state.robots_txt_status = rt.is_allowed(path_and_query(&state.url));
         }
     }
 
-    // 6. Apply robots.txt sitemap URLs
-    if let Some(rt) = &robots_txt {
-        for sitemap_url in &rt.sitemaps {
-            let key = normalize_url_key(sitemap_url);
-            states.entry(key).or_insert_with(|| {
-                let mut s = UrlState::new(sitemap_url.clone());
-                s.add_source(UrlSource::RobotsTxt);
-                s
-            });
+    // 6. In static mode, discovered page targets without a matching HTML file do not resolve.
+    for state in states.values_mut() {
+        if state.http_status.is_none()
+            && state.url.origin() == base_url.origin()
+            && (state.found_in_sitemap
+                || state.sources.contains(&UrlSource::InternalLink)
+                || state.sources.contains(&UrlSource::Canonical))
+        {
+            state.http_status = Some(404);
         }
     }
 
@@ -147,7 +135,7 @@ pub fn build_snapshot(result: StaticScanResult, public_origin: Option<Url>) -> S
 
     // 9. Build snapshot
     let statistics = Statistics::from_url_states(&states);
-    Snapshot {
+    Ok(Snapshot {
         version: "1.0".to_string(),
         tool: "crawlcontract".to_string(),
         base_url,
@@ -155,128 +143,7 @@ pub fn build_snapshot(result: StaticScanResult, public_origin: Option<Url>) -> S
         scanned_at: utc_now(),
         urls: states,
         statistics,
-    }
-}
-
-/// Compute effective canonical, effective robots, and indexability for all URLs.
-fn compute_derived_state(states: &mut BTreeMap<String, UrlState>) {
-    // First pass: compute effective canonical
-    let canonical_map: BTreeMap<String, Option<Url>> = states
-        .iter()
-        .map(|(key, state)| {
-            let effective = resolve_effective_canonical(state, states);
-            (key.clone(), effective)
-        })
-        .collect();
-
-    for (key, canonical) in &canonical_map {
-        if let Some(state) = states.get_mut(key) {
-            state.effective_canonical = canonical.clone();
-        }
-    }
-
-    // Second pass: compute effective robots and indexability
-    let keys: Vec<String> = states.keys().cloned().collect();
-    for key in &keys {
-        let state = states.get(key).unwrap();
-
-        let effective_robots = crate::signals::robots_directive::effective_robots_directive(
-            state.html_meta_robots.as_ref(),
-            state.http_x_robots_tag.as_ref(),
-        );
-
-        // A page is indexable when:
-        // - No noindex directive
-        // - Not blocked by robots.txt (blocked pages can still be indexed
-        //   but without content, which is generally undesirable)
-        // - HTTP status is 2xx (or unknown for static)
-        // - Does not canonicalize elsewhere
-        let no_noindex = !effective_robots.is_noindex();
-        let not_blocked = state.robots_txt_status != RobotsTxtStatus::Blocked;
-        let ok_status = state.http_status.map(|s| s < 400).unwrap_or(true); // static files assume 200
-        let is_canonical = state
-            .effective_canonical
-            .as_ref()
-            .map(|c| c == &state.url)
-            .unwrap_or(true); // no canonical = self-canonical
-
-        let is_indexable = no_noindex && not_blocked && ok_status && is_canonical;
-
-        let state = states.get_mut(key).unwrap();
-        state.effective_robots = effective_robots;
-        state.is_indexable = is_indexable;
-    }
-}
-
-/// Resolve the effective canonical URL for a state.
-/// Follows the chain: html_canonical → http_canonical → self.
-fn resolve_effective_canonical(
-    state: &UrlState,
-    _states: &BTreeMap<String, UrlState>,
-) -> Option<Url> {
-    // Prefer HTML canonical, then HTTP canonical
-    let canonical = state
-        .html_canonical
-        .as_ref()
-        .or(state.http_canonical.as_ref());
-
-    canonical.cloned()
-}
-
-/// Compute reachability via BFS from entry points.
-/// Entry points: homepage, any URL found in both sitemap and internal links.
-fn compute_reachability(states: &mut BTreeMap<String, UrlState>, base_url: &Url) {
-    use std::collections::{HashSet, VecDeque};
-
-    // Build adjacency list from internal links
-    let adjacency: BTreeMap<String, Vec<String>> = states
-        .iter()
-        .map(|(key, state)| {
-            let targets: Vec<String> = state
-                .internal_links_out
-                .iter()
-                .map(normalize_url_key)
-                .collect();
-            (key.clone(), targets)
-        })
-        .collect();
-
-    // Entry points: homepage + any URL found via internal links
-    let mut queue = VecDeque::new();
-    let mut visited = HashSet::new();
-
-    // Homepage is always an entry point
-    let homepage_key = normalize_url_key(base_url);
-    if states.contains_key(&homepage_key) {
-        queue.push_back(homepage_key.clone());
-        visited.insert(homepage_key);
-    }
-
-    // Also seed from any URL that was discovered via DirectScan (i.e., found as an HTML file)
-    for (key, state) in states.iter() {
-        if state.sources.contains(&UrlSource::DirectScan) && !visited.contains(key) {
-            queue.push_back(key.clone());
-            visited.insert(key.clone());
-        }
-    }
-
-    // BFS
-    while let Some(current) = queue.pop_front() {
-        if let Some(neighbors) = adjacency.get(&current) {
-            for neighbor in neighbors {
-                if visited.insert(neighbor.clone()) {
-                    queue.push_back(neighbor.clone());
-                }
-            }
-        }
-    }
-
-    // Mark reachable URLs
-    for key in &visited {
-        if let Some(state) = states.get_mut(key) {
-            state.is_reachable = true;
-        }
-    }
+    })
 }
 
 /// Recursively walk a directory, returning all file paths.
@@ -290,18 +157,25 @@ fn walk_dir_inner(dir: &Path, result: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     if !dir.is_dir() {
         return Ok(());
     }
-    for entry in
-        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?
-    {
-        let entry = entry?;
+    let mut entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading directory {}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             walk_dir_inner(&path, result)?;
-        } else {
+        } else if file_type.is_file() {
             result.push(path);
         }
     }
     Ok(())
+}
+
+fn path_and_query(url: &Url) -> &str {
+    &url[url::Position::BeforePath..url::Position::AfterQuery]
 }
 
 /// Check if a file path is an HTML file.
@@ -337,9 +211,11 @@ fn file_path_to_url(file_path: &Path, dist_root: &Path, base_url: &Url) -> anyho
         format!("/{}", relative_str)
     };
 
-    base_url
-        .join(&url_path)
-        .with_context(|| format!("joining {base_url} with {url_path}"))
+    let mut url = base_url.clone();
+    url.set_path(&url_path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
 }
 
 #[cfg(test)]
@@ -385,6 +261,19 @@ mod tests {
     }
 
     #[test]
+    fn file_path_to_url_encodes_url_delimiters_in_filenames() {
+        let url = file_path_to_url(
+            Path::new("/dist/question?#.html"),
+            Path::new("/dist"),
+            &base(),
+        )
+        .unwrap();
+        assert_eq!(url.path(), "/question%3F%23");
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
+    }
+
+    #[test]
     fn discover_files_finds_html() {
         let tmp = tempfile::tempdir().unwrap();
         let dist = tmp.path().join("dist");
@@ -395,6 +284,7 @@ mod tests {
         let result = discover_files(&dist, &base()).unwrap();
         assert_eq!(result.html_files.len(), 1);
         assert!(result.robots_txt_body.is_some());
+        assert!(result.sitemap_files.is_empty());
     }
 
     #[test]
@@ -422,10 +312,41 @@ mod tests {
         .unwrap();
 
         let result = discover_files(&dist, &base()).unwrap();
-        let snapshot = build_snapshot(result, None);
+        let snapshot = build_snapshot(result, None).unwrap();
 
         assert_eq!(snapshot.statistics.total_urls, 2);
         assert_eq!(snapshot.statistics.indexable_urls, 2);
         assert_eq!(snapshot.statistics.orphan_urls, 0);
+    }
+
+    #[test]
+    fn missing_static_link_target_is_broken_and_not_indexable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        fs::write(
+            dist.join("index.html"),
+            r#"<html><body><a href="/missing">Missing</a></body></html>"#,
+        )
+        .unwrap();
+
+        let result = discover_files(&dist, &base()).unwrap();
+        let snapshot = build_snapshot(result, None).unwrap();
+        let missing = snapshot.urls.get("https://example.test/missing").unwrap();
+        assert_eq!(missing.http_status, Some(404));
+        assert!(!missing.is_indexable);
+    }
+
+    #[test]
+    fn invalid_sitemap_fails_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist = tmp.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        fs::write(dist.join("index.html"), "<html></html>").unwrap();
+        fs::write(dist.join("sitemap.xml"), "<urlset><url>").unwrap();
+
+        let result = discover_files(&dist, &base()).unwrap();
+        let error = build_snapshot(result, None).unwrap_err();
+        assert!(error.to_string().contains("parsing sitemap sitemap.xml"));
     }
 }

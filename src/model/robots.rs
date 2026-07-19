@@ -24,21 +24,19 @@ impl RobotsDirective {
         self.nofollow == Some(true)
     }
 
-    /// Merge two directives. When both set the same field, `other` wins.
-    /// This models the combination of meta robots + X-Robots-Tag where the
-    /// more restrictive interpretation applies. Google treats them as additive.
+    /// Merge two additive directives using the more restrictive value on conflict.
     pub fn merge(&self, other: &RobotsDirective) -> RobotsDirective {
         RobotsDirective {
-            noindex: other.noindex.or(self.noindex),
-            nofollow: other.nofollow.or(self.nofollow),
-            noarchive: other.noarchive.or(self.noarchive),
-            nosnippet: other.nosnippet.or(self.nosnippet),
-            max_snippet: other.max_snippet.or(self.max_snippet),
-            max_image_preview: other
-                .max_image_preview
-                .clone()
-                .or_else(|| self.max_image_preview.clone()),
-            max_video_preview: other.max_video_preview.or(self.max_video_preview),
+            noindex: restrictive_bool(self.noindex, other.noindex),
+            nofollow: restrictive_bool(self.nofollow, other.nofollow),
+            noarchive: restrictive_bool(self.noarchive, other.noarchive),
+            nosnippet: restrictive_bool(self.nosnippet, other.nosnippet),
+            max_snippet: restrictive_limit(self.max_snippet, other.max_snippet),
+            max_image_preview: restrictive_image_preview(
+                self.max_image_preview.as_deref(),
+                other.max_image_preview.as_deref(),
+            ),
+            max_video_preview: restrictive_limit(self.max_video_preview, other.max_video_preview),
             unavailable_after: other
                 .unavailable_after
                 .clone()
@@ -59,6 +57,48 @@ impl RobotsDirective {
     }
 }
 
+fn restrictive_bool(left: Option<bool>, right: Option<bool>) -> Option<bool> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left || right),
+        (left, right) => left.or(right),
+    }
+}
+
+fn restrictive_limit(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => match (left < 0, right < 0) {
+            (true, false) => Some(right),
+            (false, true) => Some(left),
+            _ => Some(left.min(right)),
+        },
+        (left, right) => left.or(right),
+    }
+}
+
+fn restrictive_image_preview(left: Option<&str>, right: Option<&str>) -> Option<String> {
+    fn rank(value: &str) -> u8 {
+        match value.to_ascii_lowercase().as_str() {
+            "none" => 0,
+            "standard" => 1,
+            "large" => 2,
+            _ => 3,
+        }
+    }
+
+    match (left, right) {
+        (Some(left), Some(right)) => Some(
+            if rank(left) <= rank(right) {
+                left
+            } else {
+                right
+            }
+            .into(),
+        ),
+        (Some(value), None) | (None, Some(value)) => Some(value.into()),
+        (None, None) => None,
+    }
+}
+
 /// Parse a robots directive value string like "noindex, nofollow" into a RobotsDirective.
 pub fn parse_directive_value(value: &str) -> RobotsDirective {
     let mut directive = RobotsDirective::default();
@@ -69,11 +109,24 @@ pub fn parse_directive_value(value: &str) -> RobotsDirective {
             "nofollow" => directive.nofollow = Some(true),
             "noarchive" => directive.noarchive = Some(true),
             "nosnippet" => directive.nosnippet = Some(true),
-            "index" => directive.noindex = Some(false),
-            "follow" => directive.nofollow = Some(false),
+            "none" => {
+                directive.noindex = Some(true);
+                directive.nofollow = Some(true);
+            }
+            "index" => {
+                directive.noindex.get_or_insert(false);
+            }
+            "follow" => {
+                directive.nofollow.get_or_insert(false);
+            }
+            "all" => {
+                directive.noindex.get_or_insert(false);
+                directive.nofollow.get_or_insert(false);
+            }
             _ if token.starts_with("max-snippet:") => {
                 if let Some(val) = token.strip_prefix("max-snippet:") {
-                    directive.max_snippet = val.trim().parse().ok();
+                    directive.max_snippet =
+                        restrictive_limit(directive.max_snippet, val.trim().parse().ok());
                 }
             }
             _ if token.starts_with("max-image-preview:") => {
@@ -83,7 +136,8 @@ pub fn parse_directive_value(value: &str) -> RobotsDirective {
             }
             _ if token.starts_with("max-video-preview:") => {
                 if let Some(val) = token.strip_prefix("max-video-preview:") {
-                    directive.max_video_preview = val.trim().parse().ok();
+                    directive.max_video_preview =
+                        restrictive_limit(directive.max_video_preview, val.trim().parse().ok());
                 }
             }
             _ if token.starts_with("unavailable_after:") => {
@@ -119,12 +173,20 @@ mod tests {
     }
 
     #[test]
-    fn merge_prefers_other() {
+    fn merge_keeps_more_restrictive_boolean() {
         let a = parse_directive_value("noindex");
         let b = parse_directive_value("index");
         let merged = a.merge(&b);
-        // other (b) wins: index overrides noindex
-        assert_eq!(merged.noindex, Some(false));
+        assert_eq!(merged.noindex, Some(true));
+    }
+
+    #[test]
+    fn merge_keeps_more_restrictive_limits() {
+        let a = parse_directive_value("max-snippet:100, max-image-preview:large");
+        let b = parse_directive_value("max-snippet:20, max-image-preview:none");
+        let merged = a.merge(&b);
+        assert_eq!(merged.max_snippet, Some(20));
+        assert_eq!(merged.max_image_preview.as_deref(), Some("none"));
     }
 
     #[test]
@@ -138,5 +200,22 @@ mod tests {
         let d = parse_directive_value("max-snippet:100");
         assert_eq!(d.max_snippet, Some(100));
         assert!(d.is_set());
+    }
+
+    #[test]
+    fn restrictive_tokens_win_within_one_directive() {
+        let directive = parse_directive_value(
+            "index, noindex, follow, nofollow, max-snippet:-1, max-snippet:20",
+        );
+        assert!(directive.is_noindex());
+        assert!(directive.is_nofollow());
+        assert_eq!(directive.max_snippet, Some(20));
+    }
+
+    #[test]
+    fn none_expands_to_noindex_nofollow() {
+        let directive = parse_directive_value("none");
+        assert!(directive.is_noindex());
+        assert!(directive.is_nofollow());
     }
 }

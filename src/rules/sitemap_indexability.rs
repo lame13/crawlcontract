@@ -5,6 +5,7 @@ use crate::rules::registry::{Evidence, Finding, Rule, Severity};
 /// CC-SITEMAP-INDEXABILITY-001: URL in sitemap but effective directive is noindex.
 /// CC-SITEMAP-INDEXABILITY-002: URL in sitemap but robots.txt blocks crawling.
 /// CC-SITEMAP-INDEXABILITY-003: URL in sitemap but canonicalizes elsewhere.
+/// CC-SITEMAP-INDEXABILITY-004: URL in sitemap but does not resolve successfully.
 pub struct SitemapIndexabilityRule;
 
 impl Rule for SitemapIndexabilityRule {
@@ -75,6 +76,36 @@ impl Rule for SitemapIndexabilityRule {
                     });
                 }
             }
+
+            // 004: sitemap target must be verified as a successful page response
+            if state.robots_txt_status != RobotsTxtStatus::Blocked
+                && !state
+                    .http_status
+                    .map(|status| status == 200)
+                    .unwrap_or(false)
+            {
+                let observed = state
+                    .http_status
+                    .map(|status| format!("HTTP {status}"))
+                    .unwrap_or_else(|| "not fetched or absent from static output".to_string());
+                findings.push(Finding {
+                    rule_id: "CC-SITEMAP-INDEXABILITY-004".to_string(),
+                    severity: Severity::Error,
+                    url: state.url.to_string(),
+                    message: "The sitemap declares this URL, but it did not resolve to a \
+                              successful page response."
+                        .to_string(),
+                    evidence: Evidence {
+                        declared: Some("sitemap.xml".to_string()),
+                        observed: Some(observed),
+                        canonical: state
+                            .effective_canonical
+                            .as_ref()
+                            .map(|url| url.to_string()),
+                        detail: None,
+                    },
+                });
+            }
         }
 
         findings
@@ -113,6 +144,7 @@ mod tests {
             noindex: Some(true),
             ..Default::default()
         };
+        state.http_status = Some(200);
         state.is_indexable = false;
         urls.insert(url.to_string(), state);
 
@@ -167,10 +199,27 @@ mod tests {
         state.found_in_sitemap = true;
         state.add_source(UrlSource::Sitemap);
         state.is_indexable = true;
+        state.http_status = Some(200);
         urls.insert(url.to_string(), state);
 
         let snapshot = make_snapshot(urls);
         let findings = SitemapIndexabilityRule.evaluate(&snapshot);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn sitemap_url_that_does_not_resolve_fails_004() {
+        let mut urls = BTreeMap::new();
+        let url = Url::parse("https://example.test/missing").unwrap();
+        let mut state = UrlState::new(url.clone());
+        state.found_in_sitemap = true;
+        state.add_source(UrlSource::Sitemap);
+        state.http_status = Some(404);
+        urls.insert(url.to_string(), state);
+
+        let findings = SitemapIndexabilityRule.evaluate(&make_snapshot(urls));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.rule_id == "CC-SITEMAP-INDEXABILITY-004"));
     }
 }

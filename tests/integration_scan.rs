@@ -24,16 +24,17 @@ fn base_url() -> Url {
 #[test]
 fn basic_site_clean_scan() {
     let result = discover_files(&fixture_path("basic-site"), &base_url()).unwrap();
-    let snapshot = build_snapshot(result, None);
+    let snapshot = build_snapshot(result, None).unwrap();
 
     assert_eq!(
         snapshot.statistics.total_urls,
-        5,
+        4,
         "URLs: {:?}",
         snapshot.urls.keys().collect::<Vec<_>>()
     );
-    assert_eq!(snapshot.statistics.indexable_urls, 5);
-    assert_eq!(snapshot.statistics.orphan_urls, 1); // sitemap.xml is orphaned
+    assert_eq!(snapshot.statistics.indexable_urls, 4);
+    assert_eq!(snapshot.statistics.orphan_urls, 0);
+    assert_eq!(snapshot.statistics.internal_link_urls, 4);
 
     let rules: Vec<Box<dyn Rule>> = vec![
         Box::new(SitemapIndexabilityRule),
@@ -43,14 +44,9 @@ fn basic_site_clean_scan() {
         Box::new(OrphanRule),
     ];
     let findings = run_all_rules(&snapshot, &rules, None);
-    // sitemap.xml is orphaned (linked from robots.txt but not from any HTML page)
-    let non_orphan_findings: Vec<_> = findings
-        .iter()
-        .filter(|f| f.rule_id != "CC-ORPHAN-001" || !f.url.contains("sitemap"))
-        .collect();
     assert!(
-        non_orphan_findings.is_empty(),
-        "Expected only sitemap orphan finding, got: {:?}",
+        findings.is_empty(),
+        "Expected no findings, got: {:?}",
         findings
     );
 }
@@ -58,7 +54,7 @@ fn basic_site_clean_scan() {
 #[test]
 fn sitemap_conflict_detects_noindex() {
     let result = discover_files(&fixture_path("sitemap-conflict"), &base_url()).unwrap();
-    let snapshot = build_snapshot(result, None);
+    let snapshot = build_snapshot(result, None).unwrap();
 
     let rules: Vec<Box<dyn Rule>> = vec![Box::new(SitemapIndexabilityRule)];
     let findings = run_all_rules(&snapshot, &rules, None);
@@ -75,7 +71,7 @@ fn sitemap_conflict_detects_noindex() {
 #[test]
 fn canonical_cycle_detected() {
     let result = discover_files(&fixture_path("canonical-cycle"), &base_url()).unwrap();
-    let snapshot = build_snapshot(result, None);
+    let snapshot = build_snapshot(result, None).unwrap();
 
     let rules: Vec<Box<dyn Rule>> = vec![Box::new(CanonicalResolutionRule)];
     let findings = run_all_rules(&snapshot, &rules, None);
@@ -92,7 +88,7 @@ fn canonical_cycle_detected() {
 #[test]
 fn orphan_page_detected() {
     let result = discover_files(&fixture_path("orphan-pages"), &base_url()).unwrap();
-    let snapshot = build_snapshot(result, None);
+    let snapshot = build_snapshot(result, None).unwrap();
 
     let rules: Vec<Box<dyn Rule>> = vec![Box::new(OrphanRule)];
     let findings = run_all_rules(&snapshot, &rules, None);
@@ -109,7 +105,7 @@ fn orphan_page_detected() {
 #[test]
 fn hreflang_missing_reciprocity() {
     let result = discover_files(&fixture_path("hreflang-broken"), &base_url()).unwrap();
-    let snapshot = build_snapshot(result, None);
+    let snapshot = build_snapshot(result, None).unwrap();
 
     let rules: Vec<Box<dyn Rule>> = vec![Box::new(HreflangReciprocalRule)];
     let findings = run_all_rules(&snapshot, &rules, None);
@@ -127,7 +123,7 @@ fn hreflang_missing_reciprocity() {
 #[test]
 fn policy_exclusion_works() {
     let result = discover_files(&fixture_path("orphan-pages"), &base_url()).unwrap();
-    let snapshot = build_snapshot(result, None);
+    let snapshot = build_snapshot(result, None).unwrap();
 
     let policy_str = r#"
 [[exclusions]]
@@ -150,7 +146,7 @@ reason = "Known orphan, excluded"
 #[test]
 fn snapshot_serialization_roundtrip() {
     let result = discover_files(&fixture_path("basic-site"), &base_url()).unwrap();
-    let snapshot = build_snapshot(result, None);
+    let snapshot = build_snapshot(result, None).unwrap();
 
     let json = crawlcontract::output::json::snapshot_to_json(&snapshot).unwrap();
     let restored = crawlcontract::output::json::snapshot_from_json(&json).unwrap();

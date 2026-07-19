@@ -1,9 +1,10 @@
 use crate::model::snapshot::Snapshot;
 use crate::rules::registry::{Evidence, Finding, Rule, Severity};
+use crate::scanner::html_signals::normalize_url_key;
 
 /// CC-CANONICAL-CONSISTENCY-001: HTML canonical conflicts with HTTP Link header canonical.
-/// CC-CANONICAL-CONSISTENCY-002: HTML canonical conflicts with sitemap presence.
 /// CC-CANONICAL-CONSISTENCY-003: Canonical target does not resolve (non-200 or missing).
+/// CC-CANONICAL-CONSISTENCY-004: Canonical target resolves but is not indexable.
 pub struct CanonicalConsistencyRule;
 
 impl Rule for CanonicalConsistencyRule {
@@ -35,34 +36,14 @@ impl Rule for CanonicalConsistencyRule {
                 }
             }
 
-            // 002: Canonical points away but URL is in sitemap
-            if let Some(ref canonical) = state.effective_canonical {
-                if canonical != &state.url && state.found_in_sitemap {
-                    findings.push(Finding {
-                        rule_id: "CC-CANONICAL-CONSISTENCY-002".to_string(),
-                        severity: Severity::Warning,
-                        url: state.url.to_string(),
-                        message: "This URL is in the sitemap but canonicalizes elsewhere. \
-                                  The sitemap should list the canonical URL instead."
-                            .to_string(),
-                        evidence: Evidence {
-                            declared: Some("sitemap.xml".to_string()),
-                            observed: None,
-                            canonical: Some(canonical.to_string()),
-                            detail: None,
-                        },
-                    });
-                }
-            }
-
             // 003: Canonical target does not resolve
             if let Some(ref canonical) = state.effective_canonical {
                 if canonical != &state.url {
                     // Check if the canonical target exists in the snapshot
-                    let target_key = canonical.to_string();
+                    let target_key = normalize_url_key(canonical);
                     if let Some(target_state) = snapshot.urls.get(&target_key) {
-                        if let Some(status) = target_state.http_status {
-                            if status >= 400 {
+                        match target_state.http_status {
+                            Some(status) if status != 200 => {
                                 findings.push(Finding {
                                     rule_id: "CC-CANONICAL-CONSISTENCY-003".to_string(),
                                     severity: Severity::Error,
@@ -79,6 +60,39 @@ impl Rule for CanonicalConsistencyRule {
                                     },
                                 });
                             }
+                            None => {
+                                findings.push(Finding {
+                                    rule_id: "CC-CANONICAL-CONSISTENCY-003".to_string(),
+                                    severity: Severity::Error,
+                                    url: state.url.to_string(),
+                                    message: "The canonical target was discovered but not \
+                                              fetched, so it could not be verified."
+                                        .to_string(),
+                                    evidence: Evidence {
+                                        declared: None,
+                                        observed: Some("no response recorded".to_string()),
+                                        canonical: Some(canonical.to_string()),
+                                        detail: None,
+                                    },
+                                });
+                            }
+                            Some(_) if !target_state.is_indexable => {
+                                findings.push(Finding {
+                                    rule_id: "CC-CANONICAL-CONSISTENCY-004".to_string(),
+                                    severity: Severity::Error,
+                                    url: state.url.to_string(),
+                                    message: "The canonical target resolves successfully but is \
+                                              not indexable."
+                                        .to_string(),
+                                    evidence: Evidence {
+                                        declared: None,
+                                        observed: Some("canonical target is non-indexable".into()),
+                                        canonical: Some(canonical.to_string()),
+                                        detail: None,
+                                    },
+                                });
+                            }
+                            Some(_) => {}
                         }
                     } else {
                         // Canonical target not found in scan — warn

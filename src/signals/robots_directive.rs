@@ -4,15 +4,27 @@ use crate::model::robots::{parse_directive_value, RobotsDirective};
 
 /// Extract meta robots directive from `<meta name="robots" content="...">`.
 pub fn extract_meta_robots(document: &Html) -> Option<RobotsDirective> {
-    let selector = scraper::Selector::parse("meta[name=\"robots\"]").ok()?;
-    let element = document.select(&selector).next()?;
-    let content = element.value().attr("content")?;
-    let directive = parse_directive_value(content);
-    if directive.is_set() {
-        Some(directive)
-    } else {
-        None
+    let selector = scraper::Selector::parse("meta[name][content]").ok()?;
+    let mut effective: Option<RobotsDirective> = None;
+
+    for element in document.select(&selector) {
+        let Some(name) = element.value().attr("name") else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("robots") {
+            continue;
+        }
+
+        let directive = parse_directive_value(element.value().attr("content")?);
+        if directive.is_set() {
+            effective = Some(match effective {
+                Some(current) => current.merge(&directive),
+                None => directive,
+            });
+        }
     }
+
+    effective
 }
 
 /// Parse the X-Robots-Tag HTTP header value into a RobotsDirective.
@@ -26,8 +38,7 @@ pub fn parse_x_robots_tag(header_value: &str) -> Option<RobotsDirective> {
 }
 
 /// Combine meta robots and X-Robots-Tag into the effective directive.
-/// When both are present, they are merged (X-Robots-Tag takes precedence
-/// for conflicting fields, following Google's additive interpretation).
+/// When both are present, their most restrictive values are combined.
 pub fn effective_robots_directive(
     meta: Option<&RobotsDirective>,
     http: Option<&RobotsDirective>,
@@ -67,6 +78,26 @@ mod tests {
         let effective = effective_robots_directive(Some(&meta), Some(&http));
         assert!(effective.is_noindex());
         assert!(effective.is_nofollow());
+    }
+
+    #[test]
+    fn effective_noindex_is_not_overridden_by_index() {
+        let meta = parse_directive_value("noindex");
+        let http = parse_directive_value("index");
+        let effective = effective_robots_directive(Some(&meta), Some(&http));
+        assert!(effective.is_noindex());
+    }
+
+    #[test]
+    fn extract_meta_robots_combines_multiple_case_insensitively() {
+        let html = r#"<html><head>
+            <meta name="ROBOTS" content="index, nofollow">
+            <meta name="robots" content="noindex">
+        </head></html>"#;
+        let doc = Html::parse_document(html);
+        let directive = extract_meta_robots(&doc).unwrap();
+        assert!(directive.is_noindex());
+        assert!(directive.is_nofollow());
     }
 
     #[test]

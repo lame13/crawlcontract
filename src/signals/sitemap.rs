@@ -1,3 +1,6 @@
+use quick_xml::events::Event;
+use quick_xml::Reader;
+use serde::Deserialize;
 use std::collections::BTreeSet;
 use url::Url;
 
@@ -30,70 +33,95 @@ pub struct SitemapIndex {
 
 /// Parse an XML sitemap body. Returns the appropriate variant.
 pub fn parse_sitemap(body: &str) -> Result<Sitemap, SitemapParseError> {
-    // Simple XML parser using string scanning — avoids heavy XML deps for MVP.
-    let body = body.trim();
-    if body.contains("<sitemapindex") {
-        parse_sitemap_index(body)
-    } else if body.contains("<urlset") {
-        parse_url_set(body)
-    } else {
-        Err(SitemapParseError::UnknownFormat)
-    }
-}
-
-fn parse_url_set(body: &str) -> Result<Sitemap, SitemapParseError> {
-    let mut urls = Vec::new();
-    let mut remaining = body;
-
-    while let Some(start) = remaining.find("<url>") {
-        let end = remaining[start..]
-            .find("</url>")
-            .ok_or(SitemapParseError::Malformed)?;
-        let entry_xml = &remaining[start..start + end + 6];
-        remaining = &remaining[start + end + 6..];
-
-        if let Some(loc) = extract_tag(entry_xml, "loc") {
-            if let Ok(url) = Url::parse(&loc) {
-                urls.push(SitemapEntry {
-                    loc: url,
-                    lastmod: extract_tag(entry_xml, "lastmod"),
-                    changefreq: extract_tag(entry_xml, "changefreq"),
-                    priority: extract_tag(entry_xml, "priority").and_then(|p| p.parse().ok()),
-                });
-            }
+    match root_element(body)? {
+        RootElement::UrlSet => {
+            let document: XmlUrlSet = quick_xml::de::from_str(body)?;
+            let urls = document
+                .urls
+                .into_iter()
+                .map(SitemapEntry::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Sitemap::UrlSet(SitemapUrlSet { urls }))
+        }
+        RootElement::SitemapIndex => {
+            let document: XmlSitemapIndex = quick_xml::de::from_str(body)?;
+            let sitemaps = document
+                .sitemaps
+                .into_iter()
+                .map(|entry| parse_loc(&entry.loc))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Sitemap::Index(SitemapIndex { sitemaps }))
         }
     }
-
-    Ok(Sitemap::UrlSet(SitemapUrlSet { urls }))
 }
 
-fn parse_sitemap_index(body: &str) -> Result<Sitemap, SitemapParseError> {
-    let mut sitemaps = Vec::new();
-    let mut remaining = body;
+#[derive(Debug, Deserialize)]
+struct XmlUrlSet {
+    #[serde(rename = "url", default)]
+    urls: Vec<XmlSitemapEntry>,
+}
 
-    while let Some(start) = remaining.find("<sitemap>") {
-        let end = remaining[start..]
-            .find("</sitemap>")
-            .ok_or(SitemapParseError::Malformed)?;
-        let entry_xml = &remaining[start..start + end + 10];
-        remaining = &remaining[start + end + 10..];
+#[derive(Debug, Deserialize)]
+struct XmlSitemapEntry {
+    loc: String,
+    #[serde(default)]
+    lastmod: Option<String>,
+    #[serde(default)]
+    changefreq: Option<String>,
+    #[serde(default)]
+    priority: Option<f64>,
+}
 
-        if let Some(loc) = extract_tag(entry_xml, "loc") {
-            if let Ok(url) = Url::parse(&loc) {
-                sitemaps.push(url);
+#[derive(Debug, Deserialize)]
+struct XmlSitemapIndex {
+    #[serde(rename = "sitemap", default)]
+    sitemaps: Vec<XmlSitemapReference>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XmlSitemapReference {
+    loc: String,
+}
+
+impl TryFrom<XmlSitemapEntry> for SitemapEntry {
+    type Error = SitemapParseError;
+
+    fn try_from(entry: XmlSitemapEntry) -> Result<Self, Self::Error> {
+        Ok(Self {
+            loc: parse_loc(&entry.loc)?,
+            lastmod: entry.lastmod,
+            changefreq: entry.changefreq,
+            priority: entry.priority,
+        })
+    }
+}
+
+fn parse_loc(value: &str) -> Result<Url, SitemapParseError> {
+    Url::parse(value.trim()).map_err(|_| SitemapParseError::InvalidUrl(value.trim().to_string()))
+}
+
+enum RootElement {
+    UrlSet,
+    SitemapIndex,
+}
+
+fn root_element(body: &str) -> Result<RootElement, SitemapParseError> {
+    let mut reader = Reader::from_str(body);
+    reader.config_mut().trim_text(true);
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) | Event::Empty(element) => {
+                return match element.local_name().as_ref() {
+                    b"urlset" => Ok(RootElement::UrlSet),
+                    b"sitemapindex" => Ok(RootElement::SitemapIndex),
+                    _ => Err(SitemapParseError::UnknownFormat),
+                };
             }
+            Event::Eof => return Err(SitemapParseError::UnknownFormat),
+            _ => {}
         }
     }
-
-    Ok(Sitemap::Index(SitemapIndex { sitemaps }))
-}
-
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
-    let start_tag = format!("<{tag}>");
-    let end_tag = format!("</{tag}>");
-    let start = xml.find(&start_tag)? + start_tag.len();
-    let end = xml[start..].find(&end_tag)?;
-    Some(xml[start..start + end].trim().to_string())
 }
 
 /// Collect all URLs from a sitemap (recursively for sitemap indexes).
@@ -117,8 +145,12 @@ pub fn collect_sitemap_urls(sitemap: &Sitemap) -> BTreeSet<Url> {
 pub enum SitemapParseError {
     #[error("unknown sitemap format")]
     UnknownFormat,
-    #[error("malformed sitemap XML")]
-    Malformed,
+    #[error("malformed sitemap XML: {0}")]
+    MalformedXml(#[from] quick_xml::Error),
+    #[error("invalid sitemap document: {0}")]
+    MalformedDocument(#[from] quick_xml::DeError),
+    #[error("invalid URL in sitemap <loc>: {0}")]
+    InvalidUrl(String),
 }
 
 #[cfg(test)]
@@ -175,5 +207,36 @@ mod tests {
     #[test]
     fn unknown_format() {
         assert!(parse_sitemap("<html></html>").is_err());
+    }
+
+    #[test]
+    fn parses_escaped_url_and_namespaced_root() {
+        let xml = r#"<?xml version="1.0"?>
+<sm:urlset xmlns:sm="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <sm:url><sm:loc>https://example.test/search?a=1&amp;b=2</sm:loc></sm:url>
+</sm:urlset>"#;
+        let sitemap = parse_sitemap(xml).unwrap();
+        let Sitemap::UrlSet(set) = sitemap else {
+            panic!("expected urlset");
+        };
+        assert_eq!(set.urls[0].loc.query(), Some("a=1&b=2"));
+    }
+
+    #[test]
+    fn rejects_invalid_loc_instead_of_silently_dropping_it() {
+        let xml = r#"<urlset><url><loc>not a URL</loc></url></urlset>"#;
+        assert!(matches!(
+            parse_sitemap(xml),
+            Err(SitemapParseError::InvalidUrl(_))
+        ));
+    }
+
+    #[test]
+    fn parses_empty_urlset() {
+        let sitemap = parse_sitemap("<urlset/>").unwrap();
+        let Sitemap::UrlSet(set) = sitemap else {
+            panic!("expected urlset");
+        };
+        assert!(set.urls.is_empty());
     }
 }

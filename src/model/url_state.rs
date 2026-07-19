@@ -4,14 +4,16 @@ use url::Url;
 use super::hreflang::HreflangEntry;
 use super::robots::RobotsDirective;
 
-/// Where a URL was first discovered.
+/// An artifact or scan path through which a URL was discovered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum UrlSource {
     Sitemap,
     InternalLink,
     Redirect,
+    Canonical,
     Hreflang,
     DirectScan,
+    /// Retained for deserializing snapshots from early releases.
     RobotsTxt,
 }
 
@@ -21,6 +23,7 @@ impl std::fmt::Display for UrlSource {
             UrlSource::Sitemap => write!(f, "sitemap"),
             UrlSource::InternalLink => write!(f, "internal link"),
             UrlSource::Redirect => write!(f, "redirect"),
+            UrlSource::Canonical => write!(f, "canonical"),
             UrlSource::Hreflang => write!(f, "hreflang"),
             UrlSource::DirectScan => write!(f, "direct scan"),
             UrlSource::RobotsTxt => write!(f, "robots.txt"),

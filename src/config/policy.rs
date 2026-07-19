@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Policy configuration loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +47,8 @@ pub struct DiffPolicy {
     pub max_indexable_url_loss_percent: f64,
     #[serde(default = "default_max_link_loss")]
     pub max_link_loss_percent: f64,
+    #[serde(default = "default_max_word_loss")]
+    pub max_word_loss_percent: f64,
     #[serde(default = "default_max_heading_loss")]
     pub max_heading_loss_percent: f64,
 }
@@ -55,6 +58,7 @@ impl Default for DiffPolicy {
         Self {
             max_indexable_url_loss_percent: default_max_indexable_loss(),
             max_link_loss_percent: default_max_link_loss(),
+            max_word_loss_percent: default_max_word_loss(),
             max_heading_loss_percent: default_max_heading_loss(),
         }
     }
@@ -66,6 +70,9 @@ fn default_max_indexable_loss() -> f64 {
 fn default_max_link_loss() -> f64 {
     10.0
 }
+fn default_max_word_loss() -> f64 {
+    50.0
+}
 fn default_max_heading_loss() -> f64 {
     15.0
 }
@@ -74,14 +81,57 @@ impl Policy {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let policy: Policy = toml::from_str(&content)?;
+        policy.validate()?;
         Ok(policy)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for severity in &self.general.fail_on {
+            if !matches!(
+                severity.to_ascii_lowercase().as_str(),
+                "error" | "warning" | "info"
+            ) {
+                anyhow::bail!("unknown general.fail_on severity: {severity}");
+            }
+        }
+
+        if let Some(origin) = &self.general.public_origin {
+            parse_public_origin(origin)?;
+        }
+
+        for (name, value) in [
+            (
+                "max_indexable_url_loss_percent",
+                self.diff.max_indexable_url_loss_percent,
+            ),
+            ("max_link_loss_percent", self.diff.max_link_loss_percent),
+            ("max_word_loss_percent", self.diff.max_word_loss_percent),
+            (
+                "max_heading_loss_percent",
+                self.diff.max_heading_loss_percent,
+            ),
+        ] {
+            if !(0.0..=100.0).contains(&value) {
+                anyhow::bail!("diff.{name} must be between 0 and 100, got {value}");
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns true if a finding for the given rule_id and url should be excluded.
     pub fn is_excluded(&self, rule_id: &str, url: &str) -> bool {
-        self.exclusions
-            .iter()
-            .any(|ex| ex.rule_id == rule_id && glob_match(&ex.url_pattern, url))
+        let path_and_query = Url::parse(url)
+            .ok()
+            .map(|parsed| parsed[url::Position::BeforePath..url::Position::AfterQuery].to_string());
+
+        self.exclusions.iter().any(|exclusion| {
+            exclusion.rule_id == rule_id
+                && (glob_match(&exclusion.url_pattern, url)
+                    || path_and_query
+                        .as_deref()
+                        .is_some_and(|path| glob_match(&exclusion.url_pattern, path)))
+        })
     }
 
     /// Returns true if the given severity should cause a non-zero exit code.
@@ -91,6 +141,20 @@ impl Policy {
             .iter()
             .any(|s| s.eq_ignore_ascii_case(severity))
     }
+}
+
+pub fn parse_public_origin(value: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(value)?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        anyhow::bail!("public origin must be an absolute HTTP(S) URL: {value}");
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        anyhow::bail!("public origin must not contain a path, query, or fragment: {value}");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("public origin must not contain credentials: {value}");
+    }
+    Ok(url)
 }
 
 /// Simple glob matching supporting `*` (single segment) and `**` (multi-segment).
@@ -277,9 +341,32 @@ max_indexable_url_loss_percent = 10
         assert_eq!(policy.general.fail_on, vec!["error", "warning"]);
         assert_eq!(policy.exclusions.len(), 1);
         assert!(policy.is_excluded("CC-ORPHAN-001", "/admin/settings"));
+        assert!(policy.is_excluded("CC-ORPHAN-001", "https://example.test/admin/settings"));
         assert!(!policy.is_excluded("CC-ORPHAN-001", "/public/page"));
         assert!(policy.should_fail("Error"));
         assert!(policy.should_fail("WARNING"));
         assert!(!policy.should_fail("info"));
+    }
+
+    #[test]
+    fn validation_rejects_unknown_severity_and_invalid_threshold() {
+        let mut policy = Policy {
+            general: GeneralPolicy::default(),
+            exclusions: Vec::new(),
+            diff: DiffPolicy::default(),
+        };
+        policy.general.fail_on = vec!["fatal".to_string()];
+        assert!(policy.validate().is_err());
+
+        policy.general.fail_on = vec!["error".to_string()];
+        policy.diff.max_word_loss_percent = 101.0;
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn public_origin_requires_a_bare_http_origin() {
+        assert!(parse_public_origin("https://example.test").is_ok());
+        assert!(parse_public_origin("https://example.test/subpath").is_err());
+        assert!(parse_public_origin("ftp://example.test").is_err());
     }
 }

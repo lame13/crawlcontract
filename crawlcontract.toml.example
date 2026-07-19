@@ -27,5 +27,8 @@ max_indexable_url_loss_percent = 5
 # Maximum allowed decrease in internal link count per page (percentage).
 max_link_loss_percent = 10
 
+# Maximum allowed decrease in word count per page (percentage).
+max_word_loss_percent = 50
+
 # Maximum allowed decrease in heading count per page (percentage).
 max_heading_loss_percent = 15

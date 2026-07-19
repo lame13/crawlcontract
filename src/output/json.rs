@@ -26,5 +26,57 @@ pub fn snapshot_to_json(snapshot: &Snapshot) -> anyhow::Result<String> {
 
 /// Deserialize a snapshot from JSON.
 pub fn snapshot_from_json(json: &str) -> anyhow::Result<Snapshot> {
-    Ok(serde_json::from_str(json)?)
+    let snapshot: Snapshot = serde_json::from_str(json)?;
+    if snapshot.version != "1.0" {
+        anyhow::bail!("unsupported snapshot schema version: {}", snapshot.version);
+    }
+    if snapshot.tool != "crawlcontract" {
+        anyhow::bail!(
+            "snapshot was produced by an unsupported tool: {}",
+            snapshot.tool
+        );
+    }
+
+    let computed = crate::model::snapshot::Statistics::from_url_states(&snapshot.urls);
+    if snapshot.statistics != computed {
+        anyhow::bail!("snapshot statistics do not match its URL states");
+    }
+
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::snapshot::{utc_now, Statistics};
+    use std::collections::BTreeMap;
+    use url::Url;
+
+    fn empty_snapshot() -> Snapshot {
+        Snapshot {
+            version: "1.0".into(),
+            tool: "crawlcontract".into(),
+            base_url: Url::parse("https://example.test").unwrap(),
+            public_origin: None,
+            scanned_at: utc_now(),
+            urls: BTreeMap::new(),
+            statistics: Statistics::from_url_states(&BTreeMap::new()),
+        }
+    }
+
+    #[test]
+    fn rejects_stale_snapshot_statistics() {
+        let mut snapshot = empty_snapshot();
+        snapshot.statistics.total_urls = 1;
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(snapshot_from_json(&json).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_snapshot_schema() {
+        let mut snapshot = empty_snapshot();
+        snapshot.version = "2.0".into();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(snapshot_from_json(&json).is_err());
+    }
 }

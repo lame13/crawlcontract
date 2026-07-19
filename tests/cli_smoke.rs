@@ -150,5 +150,104 @@ fn version_flag() {
         .args(["--version"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("crawlcontract"));
+        .stdout(predicate::str::contains("crawlcontract 0.3.0"));
+}
+
+#[test]
+fn scan_rejects_unknown_output_format() {
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args(["scan", &fixture_path("basic-site"), "--format", "xml"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid value 'xml'"));
+}
+
+#[test]
+fn scan_rejects_output_path_without_file_format() {
+    let output = tempfile::NamedTempFile::new().unwrap();
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("basic-site"),
+            "--public-origin",
+            "https://example.test",
+            "--output",
+            output.path().to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--output requires json, markdown, or sarif output",
+        ));
+}
+
+#[test]
+fn scan_rejects_multiple_machine_formats() {
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("basic-site"),
+            "--format",
+            "json,sarif",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "select at most one of json, markdown, or sarif",
+        ));
+}
+
+#[test]
+fn policy_public_origin_takes_precedence_over_cli() {
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("crawlcontract.toml");
+    let snapshot_path = temp.path().join("snapshot.json");
+    fs::write(
+        &policy_path,
+        "[general]\npublic_origin = \"https://example.test\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("basic-site"),
+            "--public-origin",
+            "https://ignored.test",
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--snapshot",
+            snapshot_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(snapshot_path).unwrap()).unwrap();
+    assert_eq!(snapshot["base_url"], "https://example.test/");
+}
+
+#[test]
+fn scan_rejects_invalid_policy_threshold() {
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("crawlcontract.toml");
+    fs::write(&policy_path, "[diff]\nmax_word_loss_percent = 101\n").unwrap();
+
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("basic-site"),
+            "--policy",
+            policy_path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "max_word_loss_percent must be between 0 and 100",
+        ));
 }

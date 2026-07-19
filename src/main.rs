@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::process;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use url::Url;
 
-use crawlcontract::config::policy::Policy;
+use crawlcontract::config::policy::{parse_public_origin, Policy};
 use crawlcontract::diff::engine::diff_snapshots;
 use crawlcontract::output::json::{findings_to_json, snapshot_from_json, snapshot_to_json};
 use crawlcontract::output::markdown::findings_to_markdown;
@@ -18,6 +18,7 @@ use crawlcontract::rules::hreflang_canonical::HreflangCanonicalRule;
 use crawlcontract::rules::hreflang_reciprocal::HreflangReciprocalRule;
 use crawlcontract::rules::internal_link_target::InternalLinkTargetRule;
 use crawlcontract::rules::orphan::OrphanRule;
+use crawlcontract::rules::redirect_resolution::RedirectResolutionRule;
 use crawlcontract::rules::registry::{self, run_all_rules, should_fail, Rule};
 use crawlcontract::rules::robots_effective::RobotsEffectiveRule;
 use crawlcontract::rules::sitemap_indexability::SitemapIndexabilityRule;
@@ -31,6 +32,21 @@ use crawlcontract::scanner::static_dir::{build_snapshot, discover_files};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    Terminal,
+    Json,
+    Markdown,
+    Sarif,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum FailSeverity {
+    Error,
+    Warning,
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -50,16 +66,15 @@ enum Commands {
 
         /// Output format(s): terminal, json, markdown, sarif. Can be specified multiple times.
         #[arg(long, value_delimiter = ',')]
-        format: Vec<String>,
+        format: Vec<OutputFormat>,
 
         /// Write output to a file instead of stdout.
         #[arg(long)]
         output: Option<PathBuf>,
 
-        /// Fail (exit 1) on findings at or above this severity.
-        /// Values: error, warning, info. Default: error.
-        #[arg(long)]
-        fail_on: Option<String>,
+        /// Comma-separated finding severities that cause exit 1. Default: error.
+        #[arg(long, value_delimiter = ',')]
+        fail_on: Option<Vec<FailSeverity>>,
 
         /// Path to a policy file (crawlcontract.toml) for exclusions.
         #[arg(long)]
@@ -86,9 +101,9 @@ enum Commands {
         #[arg(long)]
         policy: Option<PathBuf>,
 
-        /// Output format(s): terminal, json, markdown. Can be specified multiple times.
+        /// Output format(s): terminal, json, markdown, sarif. Can be specified multiple times.
         #[arg(long, value_delimiter = ',')]
-        format: Vec<String>,
+        format: Vec<OutputFormat>,
 
         /// Write output to a file instead of stdout.
         #[arg(long)]
@@ -166,9 +181,9 @@ async fn cmd_scan(
     source: String,
     public_origin: Option<String>,
     snapshot_path: Option<PathBuf>,
-    formats: Vec<String>,
+    formats: Vec<OutputFormat>,
     output_path: Option<PathBuf>,
-    fail_on: Option<String>,
+    fail_on: Option<Vec<FailSeverity>>,
     policy_path: Option<PathBuf>,
     max_pages: usize,
     concurrency: usize,
@@ -182,14 +197,19 @@ async fn cmd_scan(
         None => None,
     };
 
-    // Determine if source is a URL or a path
-    let is_url = source.starts_with("http://") || source.starts_with("https://");
+    let public_origin = policy
+        .as_ref()
+        .and_then(|policy| policy.general.public_origin.clone())
+        .or(public_origin);
 
-    let snapshot = if is_url {
-        let start_url = Url::parse(&source).with_context(|| format!("parsing URL: {source}"))?;
+    let source_url = Url::parse(&source)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https"));
+
+    let snapshot = if let Some(start_url) = source_url {
         let public_origin_url = public_origin
             .as_ref()
-            .map(|o| Url::parse(o))
+            .map(|origin| parse_public_origin(origin))
             .transpose()
             .with_context(|| "parsing public origin")?;
 
@@ -211,14 +231,15 @@ async fn cmd_scan(
 
         // Determine base URL
         let base_url = if let Some(ref origin) = public_origin {
-            Url::parse(origin).with_context(|| format!("parsing public origin: {origin}"))?
+            parse_public_origin(origin)
+                .with_context(|| format!("parsing public origin: {origin}"))?
         } else {
             Url::parse("https://example.test").context("parsing default base URL")?
         };
 
         let public_origin_url = public_origin
             .as_ref()
-            .map(|o| Url::parse(o))
+            .map(|origin| parse_public_origin(origin))
             .transpose()
             .with_context(|| "parsing public origin")?;
 
@@ -229,10 +250,10 @@ async fn cmd_scan(
             "Found {} HTML file(s), robots.txt: {}, sitemap: {}",
             result.html_files.len(),
             result.robots_txt_body.is_some(),
-            result.sitemap_body.is_some()
+            !result.sitemap_files.is_empty()
         );
 
-        build_snapshot(result, public_origin_url)
+        build_snapshot(result, public_origin_url)?
     };
 
     // Save snapshot if requested
@@ -252,6 +273,7 @@ async fn cmd_scan(
         Box::new(HreflangReciprocalRule),
         Box::new(HreflangCanonicalRule),
         Box::new(InternalLinkTargetRule),
+        Box::new(RedirectResolutionRule),
         Box::new(OrphanRule),
     ];
 
@@ -260,45 +282,45 @@ async fn cmd_scan(
 
     // Print statistics
     let formats = if formats.is_empty() {
-        vec!["terminal".to_string()]
+        vec![OutputFormat::Terminal]
     } else {
         formats
     };
 
-    if formats.contains(&"terminal".to_string()) {
+    validate_output_selection(&formats, output_path.as_deref())?;
+
+    if formats.contains(&OutputFormat::Terminal) {
         print_statistics(&snapshot);
         print_findings(&findings);
     }
 
     // Output other formats
     for format in &formats {
-        match format.as_str() {
-            "json" => {
+        match format {
+            OutputFormat::Json => {
                 let json = findings_to_json(&findings)?;
-                write_output(&json, output_path.as_deref(), "json")?;
+                write_output(&json, output_path.as_deref())?;
             }
-            "markdown" => {
+            OutputFormat::Markdown => {
                 let md = findings_to_markdown(&findings, &snapshot);
-                write_output(&md, output_path.as_deref(), "md")?;
+                write_output(&md, output_path.as_deref())?;
             }
-            "sarif" => {
+            OutputFormat::Sarif => {
                 let sarif = findings_to_sarif(&findings)?;
-                write_output(&sarif, output_path.as_deref(), "sarif")?;
+                write_output(&sarif, output_path.as_deref())?;
             }
-            "terminal" => {} // Already printed above
-            other => {
-                eprintln!("Warning: unknown format '{other}', skipping");
-            }
+            OutputFormat::Terminal => {}
         }
     }
 
     // Determine exit code
     let fail = if let Some(ref fail_on) = fail_on {
-        let severities: Vec<String> = fail_on.split(',').map(|s| s.trim().to_string()).collect();
-        findings.iter().any(|f| {
-            severities
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(&f.severity.to_string()))
+        findings.iter().any(|finding| {
+            fail_on.iter().any(|severity| match severity {
+                FailSeverity::Error => finding.severity == registry::Severity::Error,
+                FailSeverity::Warning => finding.severity == registry::Severity::Warning,
+                FailSeverity::Info => finding.severity == registry::Severity::Info,
+            })
         })
     } else {
         should_fail(&findings, policy.as_ref())
@@ -312,7 +334,7 @@ fn cmd_diff(
     baseline_path: PathBuf,
     candidate_path: PathBuf,
     policy_path: Option<PathBuf>,
-    formats: Vec<String>,
+    formats: Vec<OutputFormat>,
     output_path: Option<PathBuf>,
 ) -> anyhow::Result<bool> {
     // Load policy
@@ -334,6 +356,13 @@ fn cmd_diff(
         snapshot_from_json(&baseline_json).with_context(|| "parsing baseline snapshot")?;
     let candidate =
         snapshot_from_json(&candidate_json).with_context(|| "parsing candidate snapshot")?;
+    if baseline.base_url != candidate.base_url {
+        anyhow::bail!(
+            "snapshot base URLs differ: baseline {}, candidate {}",
+            baseline.base_url,
+            candidate.base_url
+        );
+    }
 
     // Run diff rules
     let diff_policy = policy.as_ref().map(|p| p.diff.clone()).unwrap_or_default();
@@ -348,12 +377,14 @@ fn cmd_diff(
     let summary = diff_snapshots(&baseline, &candidate);
 
     let formats = if formats.is_empty() {
-        vec!["terminal".to_string()]
+        vec![OutputFormat::Terminal]
     } else {
         formats
     };
 
-    if formats.contains(&"terminal".to_string()) {
+    validate_output_selection(&formats, output_path.as_deref())?;
+
+    if formats.contains(&OutputFormat::Terminal) {
         println!("{summary}");
         println!();
         print_findings(&findings);
@@ -361,19 +392,20 @@ fn cmd_diff(
 
     // Output other formats
     for format in &formats {
-        match format.as_str() {
-            "json" => {
+        match format {
+            OutputFormat::Json => {
                 let json = findings_to_json(&findings)?;
-                write_output(&json, output_path.as_deref(), "json")?;
+                write_output(&json, output_path.as_deref())?;
             }
-            "markdown" => {
+            OutputFormat::Markdown => {
                 let md = findings_to_markdown(&findings, &candidate);
-                write_output(&md, output_path.as_deref(), "md")?;
+                write_output(&md, output_path.as_deref())?;
             }
-            "terminal" => {} // Already printed
-            other => {
-                eprintln!("Warning: unknown format '{other}', skipping");
+            OutputFormat::Sarif => {
+                let sarif = findings_to_sarif(&findings)?;
+                write_output(&sarif, output_path.as_deref())?;
             }
+            OutputFormat::Terminal => {}
         }
     }
 
@@ -381,11 +413,24 @@ fn cmd_diff(
     Ok(fail)
 }
 
-fn write_output(
-    content: &str,
+fn validate_output_selection(
+    formats: &[OutputFormat],
     path: Option<&std::path::Path>,
-    _default_ext: &str,
 ) -> anyhow::Result<()> {
+    let file_formats = formats
+        .iter()
+        .filter(|format| **format != OutputFormat::Terminal)
+        .count();
+    if file_formats > 1 {
+        anyhow::bail!("select at most one of json, markdown, or sarif");
+    }
+    if path.is_some() && file_formats == 0 {
+        anyhow::bail!("--output requires json, markdown, or sarif output");
+    }
+    Ok(())
+}
+
+fn write_output(content: &str, path: Option<&std::path::Path>) -> anyhow::Result<()> {
     match path {
         Some(p) => {
             std::fs::write(p, content)

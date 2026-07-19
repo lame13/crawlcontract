@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.3.0] - 2026-07-19
+
+### Added
+
+- Explicit failures for unresolved sitemap, canonical, and internal-link
+  targets and redirect cycles.
+- Standards-aware XML sitemap parsing, multiple static sitemap files, preview
+  origin mapping, and bounded concurrent live fetching.
+- Policy validation and a dedicated word-loss threshold.
+
+### Fixed
+
+- Preserve all URL discovery sources and stop treating sitemap files as page
+  URLs.
+- Compute reachability from the real entry point so orphan pages are not hidden.
+- Combine robots directives restrictively and support wildcard/end-anchored
+  `robots.txt` rules with allow-wins ties.
+- Record real scan timestamps and report the package version consistently.
+- Reject invalid output selections, snapshot schemas, stale snapshot statistics,
+  and incompatible snapshot base URLs.
+
+### Changed
+
+- Parse output formats and failure severities as validated CLI values.
+- Retire duplicate `CC-CANONICAL-CONSISTENCY-002`; sitemap/canonical mismatch is
+  reported once as `CC-SITEMAP-INDEXABILITY-003`.
+
 ## [0.2.2] - 2026-07-19
 
 ### Fixed

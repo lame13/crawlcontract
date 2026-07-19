@@ -27,7 +27,6 @@ impl Rule for HreflangReciprocalRule {
                     .collect();
                 (state.url.as_str(), entries)
             })
-            .filter(|(_, entries)| !entries.is_empty())
             .collect();
 
         for (url, entries) in &hreflang_map {

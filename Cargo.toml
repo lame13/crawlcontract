@@ -1,11 +1,14 @@
 [package]
 name = "crawlcontract"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "A deterministic CI gate that proves a site's crawl, canonical and indexability signals agree"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 repository = "https://github.com/lame13/crawlcontract"
+readme = "README.md"
+keywords = ["seo", "crawler", "canonical", "sitemap", "ci"]
+categories = ["command-line-utilities", "web-programming"]
 
 [[bin]]
 name = "crawlcontract"
@@ -20,9 +23,8 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "alloc"] }
 clap = { version = "4", features = ["derive"] }
 colored = "3"
-glob = "0.3"
-owo-colors = "4"
-rayon = "1.10"
+futures-util = "0.3"
+quick-xml = { version = "0.38", features = ["serialize"] }
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 scraper = "0.23"
 serde = { version = "1", features = ["derive"] }

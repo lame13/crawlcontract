@@ -84,7 +84,7 @@ impl Rule for DiffLossRule {
             if let (Some(bw), Some(cw)) = (baseline_state.word_count, candidate_state.word_count) {
                 if bw > 0 {
                     let loss_pct = ((bw as f64 - cw as f64) / bw as f64) * 100.0;
-                    if loss_pct > self.policy.max_heading_loss_percent && loss_pct > 50.0 {
+                    if loss_pct > self.policy.max_word_loss_percent {
                         findings.push(Finding {
                             rule_id: "CC-DIFF-LOSS-CONTENT".to_string(),
                             severity: Severity::Warning,

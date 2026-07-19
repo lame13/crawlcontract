@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Returns the current UTC time, or a fixed time if the clock feature is unavailable.
+/// Return the current UTC time without requiring chrono's platform clock feature.
 pub fn utc_now() -> DateTime<Utc> {
-    // Use a fixed timestamp for determinism in tests and environments
-    // where the system clock or chrono clock feature is unavailable.
-    DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc)
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+
+    DateTime::from_timestamp(duration.as_secs() as i64, duration.subsec_nanos())
+        .unwrap_or(DateTime::UNIX_EPOCH)
 }
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -28,7 +30,7 @@ pub struct Snapshot {
 }
 
 /// Aggregate statistics for a snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Statistics {
     pub total_urls: usize,
     pub indexable_urls: usize,

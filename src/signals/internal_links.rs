@@ -1,9 +1,20 @@
+use std::collections::BTreeSet;
+
 use scraper::Html;
 use url::Url;
 
 /// Extract all internal links from an HTML document.
 /// Returns normalized absolute URLs that share the same origin as `base_url`.
 pub fn extract_internal_links(document: &Html, base_url: &Url) -> Vec<Url> {
+    extract_internal_links_with_alias(document, base_url, None)
+}
+
+/// Extract internal links while treating an alternate crawl origin as the same site.
+pub fn extract_internal_links_with_alias(
+    document: &Html,
+    base_url: &Url,
+    crawl_origin: Option<&Url>,
+) -> Vec<Url> {
     let selector = match scraper::Selector::parse("a[href]") {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -23,29 +34,50 @@ pub fn extract_internal_links(document: &Html, base_url: &Url) -> Vec<Url> {
             {
                 return None;
             }
-            let url = base_url.join(href).ok()?;
-            // Same origin check
+            let mut url = base_url.join(href).ok()?;
             if url.origin() != base_origin {
-                return None;
+                crawl_origin.filter(|alias| url.origin() == alias.origin())?;
+                url = replace_origin(&url, base_url);
             }
             // Strip fragment for normalization
             let mut normalized = url;
             normalized.set_fragment(None);
             Some(normalized)
         })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
+}
+
+fn replace_origin(url: &Url, origin: &Url) -> Url {
+    let mut mapped = origin.clone();
+    mapped.set_path(url.path());
+    mapped.set_query(url.query());
+    mapped.set_fragment(url.fragment());
+    mapped
 }
 
 /// Count words in the visible text content of the document.
 pub fn count_words(document: &Html) -> usize {
     let body = match scraper::Selector::parse("body").ok() {
         Some(sel) => match document.select(&sel).next() {
-            Some(el) => el.text().collect::<Vec<_>>().join(" "),
+            Some(element) => element,
             None => return 0,
         },
         None => return 0,
     };
-    body.split_whitespace().count()
+    let total = body.text().flat_map(str::split_whitespace).count();
+    let excluded = scraper::Selector::parse("script, style, template, noscript")
+        .ok()
+        .map(|selector| {
+            body.select(&selector)
+                .flat_map(|element| element.text())
+                .flat_map(str::split_whitespace)
+                .count()
+        })
+        .unwrap_or(0);
+
+    total.saturating_sub(excluded)
 }
 
 /// Count headings (h1..h6) in the document.
@@ -93,8 +125,23 @@ mod tests {
     }
 
     #[test]
+    fn crawl_origin_alias_maps_to_public_origin() {
+        let html = r#"<html><body><a href="https://preview.test/page">Page</a></body></html>"#;
+        let doc = Html::parse_document(html);
+        let preview = Url::parse("https://preview.test/").unwrap();
+        let links = extract_internal_links_with_alias(&doc, &base(), Some(&preview));
+        assert_eq!(
+            links,
+            vec![Url::parse("https://example.test/page").unwrap()]
+        );
+    }
+
+    #[test]
     fn word_count() {
-        let html = r#"<html><body><p>Hello world this is a test</p></body></html>"#;
+        let html = r#"<html><body><p>Hello world this is a test</p>
+            <script>const hiddenWords = "not page copy";</script>
+            <style>.not-page-copy { color: red; }</style>
+        </body></html>"#;
         let doc = Html::parse_document(html);
         assert_eq!(count_words(&doc), 6);
     }

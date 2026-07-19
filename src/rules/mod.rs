@@ -5,6 +5,7 @@ pub mod hreflang_canonical;
 pub mod hreflang_reciprocal;
 pub mod internal_link_target;
 pub mod orphan;
+pub mod redirect_resolution;
 pub mod registry;
 pub mod robots_effective;
 pub mod sitemap_indexability;
