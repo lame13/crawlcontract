@@ -13,6 +13,8 @@ The project uses semantic versioning.
 - Standards-aware XML sitemap parsing, multiple static sitemap files, preview
   origin mapping, and bounded concurrent live fetching.
 - Policy validation and a dedicated word-loss threshold.
+- Tag-triggered Linux, macOS, and Windows release archives with SHA-256
+  checksums.
 
 ### Fixed
 

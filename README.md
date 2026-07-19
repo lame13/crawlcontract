@@ -33,7 +33,12 @@ contradictions between artifacts:
 
 ## Install
 
-Install the current Git version:
+Download a prebuilt archive for Linux x86-64, macOS Intel, macOS Apple Silicon,
+or Windows x86-64 from the
+[`latest` GitHub release](https://github.com/lame13/crawlcontract/releases/latest).
+Each release includes a `SHA256SUMS` file.
+
+Alternatively, install the current Git version:
 
 ```bash
 cargo install --git https://github.com/lame13/crawlcontract
@@ -212,8 +217,8 @@ URL or path/query glob to match. See
    migrations, severity overrides, and golden report fixtures.
 3. Strengthen release comparison: explicit URL-loss allowlists, structural
    content fingerprints, and section-level reachability changes.
-4. Ship reproducible binaries for Linux, macOS, and Windows, then publish the
-   crate after package and MSRV verification.
+4. Add build provenance for release binaries, then publish the crate after
+   package and MSRV verification.
 5. Add opt-in semantic adapters for visible breadcrumb, list, and structured
    data parity without turning the project into a generic SEO scorecard.
 
