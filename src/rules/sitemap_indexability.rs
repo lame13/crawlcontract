@@ -135,11 +135,9 @@ mod tests {
 
         let snapshot = make_snapshot(urls);
         let findings = SitemapIndexabilityRule.evaluate(&snapshot);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.rule_id == "CC-SITEMAP-INDEXABILITY-002")
-        );
+        assert!(findings
+            .iter()
+            .any(|f| f.rule_id == "CC-SITEMAP-INDEXABILITY-002"));
     }
 
     #[test]
@@ -156,11 +154,9 @@ mod tests {
 
         let snapshot = make_snapshot(urls);
         let findings = SitemapIndexabilityRule.evaluate(&snapshot);
-        assert!(
-            findings
-                .iter()
-                .any(|f| f.rule_id == "CC-SITEMAP-INDEXABILITY-003")
-        );
+        assert!(findings
+            .iter()
+            .any(|f| f.rule_id == "CC-SITEMAP-INDEXABILITY-003"));
     }
 
     #[test]

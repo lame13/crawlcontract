@@ -1,6 +1,6 @@
 use scraper::Html;
 
-use crate::model::robots::{RobotsDirective, parse_directive_value};
+use crate::model::robots::{parse_directive_value, RobotsDirective};
 
 /// Extract meta robots directive from `<meta name="robots" content="...">`.
 pub fn extract_meta_robots(document: &Html) -> Option<RobotsDirective> {

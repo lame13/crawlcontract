@@ -306,7 +306,10 @@ fn walk_dir_inner(dir: &Path, result: &mut Vec<PathBuf>) -> anyhow::Result<()> {
 
 /// Check if a file path is an HTML file.
 fn is_html_file(path: &Path) -> bool {
-    matches!(path.extension().and_then(|e| e.to_str()), Some("html") | Some("htm"))
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("html") | Some("htm")
+    )
 }
 
 /// Convert a file system path to a URL relative to the dist root.

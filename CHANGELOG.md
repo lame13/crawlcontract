@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.2.2] - 2026-07-19
+
+### Fixed
+
+- Applied `cargo fmt` formatting to source files that were inconsistent with
+  the project's default rustfmt style.
+
 ## [0.2.1] - 2026-07-19
 
 ### Added
