@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.2.1] - 2026-07-19
+
+### Added
+
+- GitHub Actions CI workflow for check, test, clippy, and format.
+- CLI smoke tests covering `scan`, `diff`, output formats, snapshot file
+  writing, policy application, and error handling.
+
 ## [0.2.0] - 2026-07-19
 
 ### Added
