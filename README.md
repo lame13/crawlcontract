@@ -63,7 +63,9 @@ crawlcontract scan ./dist \
 ```
 
 Scan a live or preview site. `--public-origin` maps preview URLs onto their
-published identity while requests still go to the preview origin:
+published identity while requests still go to the preview origin. The mapping
+applies consistently to sitemap entries, redirects, HTML and HTTP canonicals,
+hreflang, and internal links:
 
 ```bash
 crawlcontract scan https://preview.example.net \
@@ -100,6 +102,12 @@ Exit codes are stable for CI:
 | `0` | Scan completed and no configured gate failed |
 | `1` | One or more findings matched `fail_on` |
 | `2` | Invalid input, configuration, snapshot, or scan failure |
+
+Live scans fail closed with exit code `2` when the entry URL is blocked, does
+not end at an HTML `200` response, a page request fails, the page budget is
+exhausted, or a declared crawl delay exceeds 60 seconds. A failed live scan
+does not write a snapshot or print “No issues found,” because its evidence is
+not complete enough to support that claim.
 
 By default only errors fail. To fail on warnings too:
 
@@ -190,9 +198,11 @@ max_word_loss_percent = 50
 max_heading_loss_percent = 15
 ```
 
-Policy `public_origin` takes precedence over the CLI value. Thresholds must be
-between `0` and `100`. Exclusions require both the rule ID and either the full
-URL or path/query glob to match. See
+Policy `public_origin` takes precedence over the CLI value. Policy keys are
+strict: unknown fields, empty `fail_on`, unknown exclusion rule IDs, blank
+exclusion reasons, and malformed exclusion patterns are rejected. Thresholds
+must be between `0` and `100`. Exclusions require both the rule ID and either
+the full URL or path/query glob to match. See
 [`crawlcontract.toml.example`](crawlcontract.toml.example).
 
 ## Current boundaries

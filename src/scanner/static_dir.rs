@@ -30,10 +30,8 @@ pub fn discover_files(dist_path: &Path, base_url: &Url) -> anyhow::Result<Static
     for entry_path in entries {
         let relative = entry_path.strip_prefix(dist_path).unwrap_or(&entry_path);
 
-        let relative_str = relative.to_string_lossy();
-
         // Check for robots.txt
-        if relative_str == "robots.txt" {
+        if relative == Path::new("robots.txt") {
             robots_txt_body = Some(
                 std::fs::read_to_string(&entry_path)
                     .with_context(|| format!("reading {}", entry_path.display()))?,
@@ -42,11 +40,7 @@ pub fn discover_files(dist_path: &Path, base_url: &Url) -> anyhow::Result<Static
         }
 
         // Check for sitemap.xml (and variants)
-        if relative_str == "sitemap.xml"
-            || relative_str.ends_with("/sitemap.xml")
-            || relative_str.starts_with("sitemap-")
-            || relative_str.ends_with("-sitemap.xml")
-        {
+        if is_sitemap_file(relative) {
             sitemap_files.push((
                 relative.to_path_buf(),
                 std::fs::read_to_string(&entry_path)
@@ -186,6 +180,14 @@ fn is_html_file(path: &Path) -> bool {
     )
 }
 
+fn is_sitemap_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name == "sitemap.xml" || name.starts_with("sitemap-") || name.ends_with("-sitemap.xml")
+        })
+}
+
 /// Convert a file system path to a URL relative to the dist root.
 fn file_path_to_url(file_path: &Path, dist_root: &Path, base_url: &Url) -> anyhow::Result<Url> {
     let relative = file_path.strip_prefix(dist_root).with_context(|| {
@@ -196,23 +198,42 @@ fn file_path_to_url(file_path: &Path, dist_root: &Path, base_url: &Url) -> anyho
         )
     })?;
 
-    let relative_str = relative.to_string_lossy();
+    let mut parts = relative
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .map(str::to_owned)
+                .with_context(|| format!("path is not valid UTF-8: {}", relative.display()))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let file_name = parts
+        .pop()
+        .with_context(|| format!("path has no file name: {}", relative.display()))?;
 
-    // Convert index.html to directory path, other .html files strip extension
-    let url_path = if relative_str == "index.html" || relative_str == "index.htm" {
-        "/".to_string()
-    } else if relative_str.ends_with("/index.html") || relative_str.ends_with("/index.htm") {
-        format!("/{}", &relative_str[..relative_str.len() - 10])
-    } else if let Some(stripped) = relative_str.strip_suffix(".html") {
-        format!("/{stripped}")
-    } else if let Some(stripped) = relative_str.strip_suffix(".htm") {
-        format!("/{stripped}")
-    } else {
-        format!("/{}", relative_str)
-    };
+    let is_index = matches!(file_name.as_str(), "index.html" | "index.htm");
+    if !is_index {
+        let route_name = file_name
+            .strip_suffix(".html")
+            .or_else(|| file_name.strip_suffix(".htm"))
+            .unwrap_or(&file_name);
+        parts.push(route_name.to_string());
+    }
 
     let mut url = base_url.clone();
-    url.set_path(&url_path);
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("base URL cannot contain path segments: {base_url}"))?;
+        segments.clear();
+        for part in &parts {
+            segments.push(part);
+        }
+        if is_index && !parts.is_empty() {
+            segments.push("");
+        }
+    }
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
@@ -233,6 +254,18 @@ mod tests {
         assert!(is_html_file(Path::new("page.htm")));
         assert!(!is_html_file(Path::new("page.txt")));
         assert!(!is_html_file(Path::new("robots.txt")));
+    }
+
+    #[test]
+    fn recognizes_sitemap_names_from_native_path_components() {
+        assert!(is_sitemap_file(Path::new("sitemap.xml")));
+        assert!(is_sitemap_file(
+            &Path::new("nested").join("post-sitemap.xml")
+        ));
+        assert!(is_sitemap_file(
+            &Path::new("nested").join("sitemap-pages.xml")
+        ));
+        assert!(!is_sitemap_file(Path::new("sitemap.xml.bak")));
     }
 
     #[test]
@@ -271,6 +304,14 @@ mod tests {
         assert_eq!(url.path(), "/question%3F%23");
         assert!(url.query().is_none());
         assert!(url.fragment().is_none());
+    }
+
+    #[test]
+    fn file_path_to_url_uses_native_components_and_encodes_each_segment() {
+        let root = Path::new("dist");
+        let file = root.join("news archive").join("question?#.html");
+        let url = file_path_to_url(&file, root, &base()).unwrap();
+        assert_eq!(url.path(), "/news%20archive/question%3F%23");
     }
 
     #[test]

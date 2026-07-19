@@ -34,10 +34,20 @@ pub fn extract_html_signals_with_alias(
     base_url: &Url,
     crawl_origin: Option<&Url>,
 ) -> HtmlSignals {
+    let canonical = extract_html_canonical(document, base_url)
+        .map(|url| map_crawl_origin_to_public(url, base_url, crawl_origin));
+    let hreflang = extract_hreflang(document, base_url)
+        .into_iter()
+        .map(|mut entry| {
+            entry.url = map_crawl_origin_to_public(entry.url, base_url, crawl_origin);
+            entry
+        })
+        .collect();
+
     HtmlSignals {
-        canonical: extract_html_canonical(document, base_url),
+        canonical,
         meta_robots: extract_meta_robots(document),
-        hreflang: extract_hreflang(document, base_url),
+        hreflang,
         internal_links: if crawl_origin.is_some() {
             extract_internal_links_with_alias(document, base_url, crawl_origin)
         } else {
@@ -46,6 +56,21 @@ pub fn extract_html_signals_with_alias(
         word_count: count_words(document),
         heading_count: count_headings(document),
     }
+}
+
+fn map_crawl_origin_to_public(url: Url, public_url: &Url, crawl_origin: Option<&Url>) -> Url {
+    let Some(crawl_origin) = crawl_origin else {
+        return url;
+    };
+    if url.origin() != crawl_origin.origin() {
+        return url;
+    }
+
+    let mut mapped = public_url.clone();
+    mapped.set_path(url.path());
+    mapped.set_query(url.query());
+    mapped.set_fragment(url.fragment());
+    mapped
 }
 
 /// Apply extracted HTML signals to a UrlState.
@@ -147,5 +172,31 @@ mod tests {
         assert_eq!(signals.internal_links.len(), 1);
         assert_eq!(signals.word_count, 5);
         assert_eq!(signals.heading_count, 1);
+    }
+
+    #[test]
+    fn maps_preview_canonical_and_hreflang_to_public_origin() {
+        let html = r#"
+<html><head>
+  <link rel="canonical" href="https://preview.test/page">
+  <link rel="alternate" hreflang="en" href="https://preview.test/page">
+  <link rel="alternate" hreflang="fr" href="https://external.test/fr/page">
+</head></html>"#;
+        let document = Html::parse_document(html);
+        let preview = Url::parse("https://preview.test/").unwrap();
+        let signals = extract_html_signals_with_alias(&document, &base(), Some(&preview));
+
+        assert_eq!(
+            signals.canonical.unwrap().as_str(),
+            "https://example.test/page"
+        );
+        assert_eq!(
+            signals.hreflang[0].url.as_str(),
+            "https://example.test/page"
+        );
+        assert_eq!(
+            signals.hreflang[1].url.as_str(),
+            "https://external.test/fr/page"
+        );
     }
 }

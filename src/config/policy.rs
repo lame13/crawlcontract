@@ -5,6 +5,7 @@ use url::Url;
 
 /// Policy configuration loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     #[serde(default)]
     pub general: GeneralPolicy,
@@ -15,6 +16,7 @@ pub struct Policy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneralPolicy {
     #[serde(default = "default_fail_on")]
     pub fail_on: Vec<String>,
@@ -35,6 +37,7 @@ fn default_fail_on() -> Vec<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Exclusion {
     pub rule_id: String,
     pub url_pattern: String,
@@ -42,6 +45,7 @@ pub struct Exclusion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiffPolicy {
     #[serde(default = "default_max_indexable_loss")]
     pub max_indexable_url_loss_percent: f64,
@@ -77,6 +81,31 @@ fn default_max_heading_loss() -> f64 {
     15.0
 }
 
+const EXCLUDABLE_RULE_IDS: &[&str] = &[
+    "CC-CANONICAL-CONSISTENCY-001",
+    "CC-CANONICAL-CONSISTENCY-003",
+    "CC-CANONICAL-CONSISTENCY-004",
+    "CC-CANONICAL-RESOLUTION-001",
+    "CC-CANONICAL-RESOLUTION-002",
+    "CC-DIFF-LOSS-CONTENT",
+    "CC-DIFF-LOSS-INDEXABLE",
+    "CC-DIFF-LOSS-LINKS",
+    "CC-HREFLANG-CANONICAL-001",
+    "CC-HREFLANG-RECIPROCAL-001",
+    "CC-HREFLANG-RECIPROCAL-002",
+    "CC-LINK-TARGET-001",
+    "CC-LINK-TARGET-002",
+    "CC-LINK-TARGET-003",
+    "CC-LINK-TARGET-004",
+    "CC-ORPHAN-001",
+    "CC-REDIRECT-RESOLUTION-001",
+    "CC-ROBOTS-EFFECTIVE-001",
+    "CC-SITEMAP-INDEXABILITY-001",
+    "CC-SITEMAP-INDEXABILITY-002",
+    "CC-SITEMAP-INDEXABILITY-003",
+    "CC-SITEMAP-INDEXABILITY-004",
+];
+
 impl Policy {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -86,6 +115,9 @@ impl Policy {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.general.fail_on.is_empty() {
+            anyhow::bail!("general.fail_on must contain at least one severity");
+        }
         for severity in &self.general.fail_on {
             if !matches!(
                 severity.to_ascii_lowercase().as_str(),
@@ -97,6 +129,31 @@ impl Policy {
 
         if let Some(origin) = &self.general.public_origin {
             parse_public_origin(origin)?;
+        }
+
+        for (index, exclusion) in self.exclusions.iter().enumerate() {
+            if !EXCLUDABLE_RULE_IDS.contains(&exclusion.rule_id.as_str()) {
+                anyhow::bail!(
+                    "exclusions[{index}].rule_id is not a known finding rule: {}",
+                    exclusion.rule_id
+                );
+            }
+            if exclusion.url_pattern.trim().is_empty() {
+                anyhow::bail!("exclusions[{index}].url_pattern must not be empty");
+            }
+            if !exclusion.url_pattern.starts_with('/')
+                && !exclusion.url_pattern.starts_with("http://")
+                && !exclusion.url_pattern.starts_with("https://")
+            {
+                anyhow::bail!(
+                    "exclusions[{index}].url_pattern must be an absolute HTTP(S) URL or start \
+                     with '/': {}",
+                    exclusion.url_pattern
+                );
+            }
+            if exclusion.reason.trim().is_empty() {
+                anyhow::bail!("exclusions[{index}].reason must not be empty");
+            }
         }
 
         for (name, value) in [
@@ -361,6 +418,42 @@ max_indexable_url_loss_percent = 10
         policy.general.fail_on = vec!["error".to_string()];
         policy.diff.max_word_loss_percent = 101.0;
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_empty_fail_on_and_invalid_exclusions() {
+        let mut policy = Policy {
+            general: GeneralPolicy::default(),
+            exclusions: Vec::new(),
+            diff: DiffPolicy::default(),
+        };
+        policy.general.fail_on.clear();
+        assert!(policy.validate().is_err());
+
+        policy.general.fail_on = default_fail_on();
+        policy.exclusions.push(Exclusion {
+            rule_id: "CC-ORPHAN-999".to_string(),
+            url_pattern: "/admin/**".to_string(),
+            reason: "Known exception".to_string(),
+        });
+        assert!(policy.validate().is_err());
+
+        policy.exclusions[0].rule_id = "CC-ORPHAN-001".to_string();
+        policy.exclusions[0].url_pattern = "admin/**".to_string();
+        assert!(policy.validate().is_err());
+
+        policy.exclusions[0].url_pattern = "/admin/**".to_string();
+        policy.exclusions[0].reason.clear();
+        assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn deserialization_rejects_unknown_policy_fields() {
+        let error = toml::from_str::<Policy>(
+            "[general]\nfail_on = [\"error\"]\npublic_orgin = \"https://example.test\"\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown field `public_orgin`"));
     }
 
     #[test]

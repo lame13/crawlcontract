@@ -17,6 +17,8 @@ use crate::signals::robots_directive::parse_x_robots_tag;
 use crate::signals::robots_txt::RobotsTxt;
 use crate::signals::sitemap::{collect_sitemap_urls, parse_sitemap, Sitemap};
 
+const MAX_CRAWL_DELAY: Duration = Duration::from_secs(60);
+
 /// Configuration for a live scan.
 pub struct LiveScanConfig {
     pub start_url: Url,
@@ -71,6 +73,7 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
         .map(origin_url)
         .unwrap_or_else(|| crawl_origin.clone());
     let entry_url = remap_origin(&config.start_url, &crawl_origin, &base_url);
+    let entry_key = normalize_url_key(&entry_url);
 
     let client = Client::builder()
         .user_agent(&config.user_agent)
@@ -92,14 +95,21 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
         Ok(_) => None,
         Err(error) => return Err(error).context("fetching robots.txt"),
     };
+    let effective_delay = resolve_crawl_delay(
+        config.crawl_delay,
+        robots_txt.as_ref().and_then(|robots| robots.crawl_delay),
+    )?;
 
     // 2. Discover sitemap URLs
     let mut sitemap_urls = BTreeSet::new();
-    let sitemap_locations = robots_txt
+    let sitemap_locations: Vec<Url> = robots_txt
         .as_ref()
         .map(|robots| robots.sitemaps.clone())
         .filter(|locations| !locations.is_empty())
-        .unwrap_or_else(|| vec![base_url.join("/sitemap.xml").expect("valid origin URL")]);
+        .unwrap_or_else(|| vec![base_url.join("/sitemap.xml").expect("valid origin URL")])
+        .into_iter()
+        .map(|url| remap_origin(&url, &crawl_origin, &base_url))
+        .collect();
     let has_declared_sitemaps = robots_txt
         .as_ref()
         .is_some_and(|robots| !robots.sitemaps.is_empty());
@@ -111,13 +121,17 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
                 if let Some(body) = &response.body {
                     let sitemap = parse_sitemap(body)
                         .with_context(|| format!("parsing sitemap {sitemap_url}"))?;
-                    let urls = collect_sitemap_urls(&sitemap);
+                    let urls = collect_sitemap_urls(&sitemap)
+                        .into_iter()
+                        .map(|url| remap_origin(&url, &crawl_origin, &base_url));
                     sitemap_urls.extend(urls);
 
                     // Handle one sitemap-index level.
                     if let Sitemap::Index(idx) = &sitemap {
                         for child_url in &idx.sitemaps {
-                            let child_fetch_url = remap_origin(child_url, &base_url, &crawl_origin);
+                            let child_url = remap_origin(child_url, &crawl_origin, &base_url);
+                            let child_fetch_url =
+                                remap_origin(&child_url, &base_url, &crawl_origin);
                             let child_resp = fetch_url(&client, &child_fetch_url)
                                 .await
                                 .with_context(|| format!("fetching child sitemap {child_url}"))?;
@@ -132,7 +146,11 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
                                     parse_sitemap(child_body).with_context(|| {
                                         format!("parsing child sitemap {child_url}")
                                     })?;
-                                sitemap_urls.extend(collect_sitemap_urls(&child_sitemap));
+                                sitemap_urls.extend(
+                                    collect_sitemap_urls(&child_sitemap)
+                                        .into_iter()
+                                        .map(|url| remap_origin(&url, &crawl_origin, &base_url)),
+                                );
                             }
                         }
                     }
@@ -174,9 +192,7 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
 
     // 4. BFS crawl
     let mut pages_fetched = 0;
-    let effective_delay = config.crawl_delay.or(robots_txt
-        .as_ref()
-        .and_then(|rt| rt.crawl_delay.map(Duration::from_secs_f64)));
+    let mut has_fetched_page = false;
 
     while !queue.is_empty() && pages_fetched < config.max_pages {
         let batch_size = if effective_delay.is_some() {
@@ -200,12 +216,15 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
                 .map(|robots| robots.is_allowed(path_and_query(&url)))
                 .unwrap_or(RobotsTxtStatus::NoRule);
             let state = states
-                .entry(key)
+                .entry(key.clone())
                 .or_insert_with(|| UrlState::new(url.clone()));
             state.add_source(UrlSource::DirectScan);
             state.robots_txt_status = robots_status;
 
             if robots_status == RobotsTxtStatus::Blocked {
+                if key == entry_key {
+                    anyhow::bail!("entry URL {entry_url} is blocked by robots.txt");
+                }
                 continue;
             }
 
@@ -216,8 +235,10 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
         if batch.is_empty() {
             continue;
         }
-        if let Some(delay) = effective_delay {
-            tokio::time::sleep(delay).await;
+        if has_fetched_page {
+            if let Some(delay) = effective_delay {
+                tokio::time::sleep(delay).await;
+            }
         }
 
         let mut fetched_pages = stream::iter(batch)
@@ -235,16 +256,30 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
             .buffer_unordered(batch_size)
             .collect::<Vec<_>>()
             .await;
+        has_fetched_page = true;
         fetched_pages.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
 
         for (requested_url, fetched) in fetched_pages {
             let fetched = match fetched {
                 Ok(fetched) => fetched,
                 Err(error) => {
-                    tracing::warn!("Failed to fetch {}: {}", requested_url, error);
-                    continue;
+                    return Err(error)
+                        .with_context(|| format!("fetching discovered page {requested_url}"));
                 }
             };
+
+            if normalize_url_key(&requested_url) == entry_key {
+                if fetched.status != 200 {
+                    anyhow::bail!(
+                        "entry URL {entry_url} did not resolve to HTTP 200 (terminal status: \
+                         HTTP {})",
+                        fetched.status
+                    );
+                }
+                if fetched.body.is_none() {
+                    anyhow::bail!("entry URL {entry_url} returned HTTP 200 without an HTML body");
+                }
+            }
 
             let requested_key = normalize_url_key(&requested_url);
             let redirect_chain: Vec<Url> = fetched
@@ -290,7 +325,8 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
                     }
                     "link" => {
                         if let Some(canonical) = extract_http_canonical(value, &final_url) {
-                            state.http_canonical = Some(canonical);
+                            state.http_canonical =
+                                Some(remap_origin(&canonical, &crawl_origin, &base_url));
                         }
                     }
                     _ => {}
@@ -354,6 +390,22 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
                 state.add_source(source);
             }
         }
+    }
+
+    if pages_fetched == config.max_pages
+        && queue.iter().any(|url| {
+            !visited.contains(&normalize_url_key(url))
+                && robots_txt
+                    .as_ref()
+                    .map(|robots| robots.is_allowed(path_and_query(url)))
+                    .unwrap_or(RobotsTxtStatus::NoRule)
+                    != RobotsTxtStatus::Blocked
+        })
+    {
+        anyhow::bail!(
+            "page limit of {} reached before the live scan completed; increase --max-pages",
+            config.max_pages
+        );
     }
 
     // 5. Compute derived state
@@ -566,14 +618,134 @@ fn is_html_content_type(value: &str) -> bool {
     )
 }
 
+fn resolve_crawl_delay(
+    configured: Option<Duration>,
+    robots_seconds: Option<f64>,
+) -> anyhow::Result<Option<Duration>> {
+    let delay = match configured {
+        Some(delay) => Some(delay),
+        None => robots_seconds
+            .map(Duration::try_from_secs_f64)
+            .transpose()
+            .context("invalid robots.txt Crawl-delay")?,
+    };
+
+    if delay.is_some_and(|delay| delay > MAX_CRAWL_DELAY) {
+        anyhow::bail!(
+            "crawl delay exceeds the supported maximum of {} seconds",
+            MAX_CRAWL_DELAY.as_secs()
+        );
+    }
+    Ok(delay)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    struct TestResponse {
+        status: &'static str,
+        content_type: &'static str,
+        headers: String,
+        body: String,
+    }
+
+    impl TestResponse {
+        fn new(status: &'static str, content_type: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                content_type,
+                headers: String::new(),
+                body: body.into(),
+            }
+        }
+
+        fn with_header(mut self, name: &str, value: &str) -> Self {
+            self.headers.push_str(name);
+            self.headers.push_str(": ");
+            self.headers.push_str(value);
+            self.headers.push_str("\r\n");
+            self
+        }
+    }
+
+    struct TestServer {
+        address: SocketAddr,
+        stop_tx: Option<mpsc::Sender<()>>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start(
+            handler: impl Fn(&str, SocketAddr) -> Option<TestResponse> + Send + 'static,
+        ) -> std::io::Result<Self> {
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            listener.set_nonblocking(true)?;
+            let address = listener.local_addr()?;
+            let (stop_tx, stop_rx) = mpsc::channel();
+            let thread = thread::spawn(move || loop {
+                if !matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                    break;
+                }
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accepting test connection: {error}"),
+                };
+                let mut request = [0_u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap();
+
+                let Some(response) = handler(path, address) else {
+                    continue;
+                };
+                let wire_response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n{}",
+                    response.status,
+                    response.content_type,
+                    response.headers,
+                    response.body.len(),
+                    response.body
+                );
+                stream.write_all(wire_response.as_bytes()).unwrap();
+            });
+
+            Ok(Self {
+                address,
+                stop_tx: Some(stop_tx),
+                thread: Some(thread),
+            })
+        }
+
+        fn url(&self, path: &str) -> Url {
+            Url::parse(&format!("http://{}{}", self.address, path)).unwrap()
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if let Some(stop_tx) = self.stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
 
     #[test]
     fn remaps_only_the_configured_origin() {
@@ -596,78 +768,65 @@ mod tests {
         assert!(!is_html_content_type("application/json"));
     }
 
+    #[test]
+    fn rejects_crawl_delays_that_could_stall_the_scan() {
+        assert_eq!(
+            resolve_crawl_delay(None, Some(1.5)).unwrap(),
+            Some(Duration::from_millis(1500))
+        );
+        assert!(resolve_crawl_delay(None, Some(61.0)).is_err());
+        assert!(resolve_crawl_delay(None, Some(1.0e300)).is_err());
+        assert!(resolve_crawl_delay(Some(Duration::from_secs(61)), None).is_err());
+    }
+
     #[tokio::test]
     async fn live_scan_maps_preview_requests_to_public_url_states() {
-        let listener = match TcpListener::bind("127.0.0.1:0") {
-            Ok(listener) => listener,
+        let server = match TestServer::start(move |path, address| {
+            let preview_origin = format!("http://{address}");
+            Some(match path {
+                "/robots.txt" => TestResponse::new(
+                    "200 OK",
+                    "text/plain",
+                    format!("User-agent: *\nAllow: /\nSitemap: {preview_origin}/sitemap.xml"),
+                ),
+                "/sitemap.xml" => TestResponse::new(
+                    "200 OK",
+                    "application/xml",
+                    format!(
+                        "<urlset><url><loc>{preview_origin}/</loc></url>\
+                         <url><loc>{preview_origin}/about</loc></url></urlset>"
+                    ),
+                ),
+                "/" => TestResponse::new(
+                    "200 OK",
+                    "text/html",
+                    format!(
+                        "<html><head><link rel=\"canonical\" href=\"{preview_origin}/\">\
+                         <link rel=\"alternate\" hreflang=\"en\" \
+                         href=\"{preview_origin}/\"></head><body>\
+                         <a href=\"{preview_origin}/about\">About</a></body></html>"
+                    ),
+                )
+                .with_header("Link", &format!("<{preview_origin}/>; rel=\"canonical\"")),
+                "/about" => TestResponse::new(
+                    "200 OK",
+                    "text/html",
+                    format!(
+                        "<html><head><link rel=\"canonical\" \
+                         href=\"{preview_origin}/about\"></head><body>\
+                         <a href=\"{preview_origin}/\">Home</a></body></html>"
+                    ),
+                ),
+                _ => TestResponse::new("404 Not Found", "text/plain", "missing"),
+            })
+        }) {
+            Ok(server) => server,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
             Err(error) => panic!("binding test server: {error}"),
         };
-        listener.set_nonblocking(true).unwrap();
-        let address = listener.local_addr().unwrap();
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let server = thread::spawn(move || loop {
-            if !matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
-                break;
-            }
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                Err(error) => panic!("accepting test connection: {error}"),
-            };
-            let mut request = [0_u8; 4096];
-            let count = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..count]);
-            let path = request
-                .lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap();
-
-            let (status, content_type, body) = match path {
-                "/robots.txt" => (
-                    "200 OK",
-                    "text/plain",
-                    "User-agent: *\nAllow: /\nSitemap: /sitemap.xml".to_string(),
-                ),
-                "/sitemap.xml" => (
-                    "200 OK",
-                    "application/xml",
-                    "<urlset><url><loc>https://example.test/</loc></url>\
-                         <url><loc>https://example.test/about</loc></url></urlset>"
-                        .to_string(),
-                ),
-                "/" => (
-                    "200 OK",
-                    "text/html",
-                    "<html><head><link rel=\"canonical\" \
-                         href=\"https://example.test/\"></head><body>\
-                         <a href=\"/about\">About</a></body></html>"
-                        .to_string(),
-                ),
-                "/about" => (
-                    "200 OK",
-                    "text/html",
-                    "<html><head><link rel=\"canonical\" \
-                         href=\"https://example.test/about\"></head><body>\
-                         <a href=\"/\">Home</a></body></html>"
-                        .to_string(),
-                ),
-                _ => ("404 Not Found", "text/plain", "missing".to_string()),
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
 
         let snapshot = scan_live(LiveScanConfig {
-            start_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            start_url: server.url("/"),
             public_origin: Some(Url::parse("https://example.test/").unwrap()),
             max_pages: 10,
             concurrency: 2,
@@ -676,8 +835,6 @@ mod tests {
         .await
         .unwrap();
 
-        stop_tx.send(()).unwrap();
-        server.join().unwrap();
         assert_eq!(snapshot.base_url.as_str(), "https://example.test/");
         assert_eq!(snapshot.statistics.total_urls, 2);
         assert_eq!(snapshot.statistics.indexable_urls, 2);
@@ -686,5 +843,106 @@ mod tests {
             snapshot.urls["https://example.test/about"].http_status,
             Some(200)
         );
+        let home = &snapshot.urls["https://example.test/"];
+        assert_eq!(
+            home.http_canonical.as_ref().unwrap().as_str(),
+            home.url.as_str()
+        );
+        assert_eq!(
+            home.html_canonical.as_ref().unwrap().as_str(),
+            home.url.as_str()
+        );
+        assert_eq!(home.hreflang[0].url, home.url);
+        assert!(snapshot
+            .urls
+            .values()
+            .all(|state| state.url.origin() == snapshot.base_url.origin()));
+    }
+
+    #[tokio::test]
+    async fn live_scan_fails_when_the_entry_response_is_not_successful_html() {
+        let server = match TestServer::start(|path, _| {
+            Some(match path {
+                "/robots.txt" | "/sitemap.xml" => {
+                    TestResponse::new("404 Not Found", "text/plain", "missing")
+                }
+                "/" => TestResponse::new("503 Service Unavailable", "text/html", "unavailable"),
+                _ => TestResponse::new("404 Not Found", "text/plain", "missing"),
+            })
+        }) {
+            Ok(server) => server,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding test server: {error}"),
+        };
+
+        let error = scan_live(LiveScanConfig {
+            start_url: server.url("/"),
+            max_pages: 10,
+            ..LiveScanConfig::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("terminal status: HTTP 503"));
+    }
+
+    #[tokio::test]
+    async fn live_scan_fails_instead_of_discarding_a_request_error() {
+        let server = match TestServer::start(|path, _| match path {
+            "/robots.txt" | "/sitemap.xml" => {
+                Some(TestResponse::new("404 Not Found", "text/plain", "missing"))
+            }
+            "/" => Some(TestResponse::new(
+                "200 OK",
+                "text/html",
+                "<html><body><a href=\"/broken\">Broken</a></body></html>",
+            )),
+            "/broken" => None,
+            _ => Some(TestResponse::new("404 Not Found", "text/plain", "missing")),
+        }) {
+            Ok(server) => server,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding test server: {error}"),
+        };
+
+        let error = scan_live(LiveScanConfig {
+            start_url: server.url("/"),
+            max_pages: 10,
+            ..LiveScanConfig::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("fetching discovered page"));
+        assert!(error.to_string().contains("/broken"));
+    }
+
+    #[tokio::test]
+    async fn live_scan_fails_when_the_page_budget_is_exhausted() {
+        let server = match TestServer::start(|path, _| {
+            Some(match path {
+                "/robots.txt" | "/sitemap.xml" => {
+                    TestResponse::new("404 Not Found", "text/plain", "missing")
+                }
+                "/" => TestResponse::new(
+                    "200 OK",
+                    "text/html",
+                    "<html><body><a href=\"/next\">Next</a></body></html>",
+                ),
+                "/next" => TestResponse::new("200 OK", "text/html", "<html></html>"),
+                _ => TestResponse::new("404 Not Found", "text/plain", "missing"),
+            })
+        }) {
+            Ok(server) => server,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("binding test server: {error}"),
+        };
+
+        let error = scan_live(LiveScanConfig {
+            start_url: server.url("/"),
+            max_pages: 1,
+            ..LiveScanConfig::default()
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("page limit of 1 reached"));
     }
 }

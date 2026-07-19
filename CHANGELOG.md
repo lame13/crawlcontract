@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.3.1] - 2026-07-19
+
+### Fixed
+
+- Fail live scans instead of reporting success when the entry response is not
+  successful HTML, a request fails, robots.txt blocks the entry point, or the
+  page budget is exhausted.
+- Map preview-origin sitemap entries, HTML and HTTP canonicals, hreflang, and
+  internal links to one consistent public identity.
+- Build static routes and recognize sitemap files from native path components
+  on Windows as well as Unix.
+- Reject unknown policy fields, empty failure gates, invalid exclusions, and
+  unsupported rule IDs instead of silently accepting ineffective policy.
+- Reject crawl delays above 60 seconds without panicking, and wait only between
+  page requests rather than before the first page.
+
 ## [0.3.0] - 2026-07-19
 
 ### Added

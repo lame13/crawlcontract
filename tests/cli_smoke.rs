@@ -1,6 +1,9 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 fn fixture_path(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -144,13 +147,48 @@ fn scan_invalid_directory_fails() {
 }
 
 #[test]
+fn live_scan_entry_503_exits_as_scan_failure() {
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("binding test server: {error}"),
+    };
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let bytes_read = stream.read(&mut request).unwrap();
+            assert!(bytes_read > 0);
+            let body = "unavailable";
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        }
+    });
+
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args(["scan", &format!("http://{address}/")])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("No issues found").not())
+        .stderr(predicate::str::contains("terminal status: HTTP 503"));
+
+    server.join().unwrap();
+}
+
+#[test]
 fn version_flag() {
     Command::cargo_bin("crawlcontract")
         .unwrap()
         .args(["--version"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("crawlcontract 0.3.0"));
+        .stdout(predicate::str::contains("crawlcontract 0.3.1"));
 }
 
 #[test]
@@ -249,5 +287,49 @@ fn scan_rejects_invalid_policy_threshold() {
         .code(2)
         .stderr(predicate::str::contains(
             "max_word_loss_percent must be between 0 and 100",
+        ));
+}
+
+#[test]
+fn scan_rejects_policy_typos_and_unknown_exclusion_rules() {
+    let temp = tempfile::tempdir().unwrap();
+    let policy_path = temp.path().join("crawlcontract.toml");
+    fs::write(
+        &policy_path,
+        "[general]\npublic_orgin = \"https://example.test\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("basic-site"),
+            "--policy",
+            policy_path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("unknown field `public_orgin`"));
+
+    fs::write(
+        &policy_path,
+        "[[exclusions]]\nrule_id = \"CC-ORPHAN-999\"\nurl_pattern = \"/admin/**\"\n\
+         reason = \"Known exception\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("basic-site"),
+            "--policy",
+            policy_path.to_str().unwrap(),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "rule_id is not a known finding rule",
         ));
 }
