@@ -1,0 +1,31 @@
+# CrawlContract policy configuration.
+# Copy this file to crawlcontract.toml and adjust as needed.
+
+[general]
+# Severities that cause a non-zero exit code.
+# Options: "error", "warning", "info"
+fail_on = ["error"]
+
+# Public origin for URL resolution. Overrides --public-origin.
+# public_origin = "https://example.com"
+
+# Exclude specific rule+URL combinations from findings.
+[[exclusions]]
+rule_id = "CC-ORPHAN-001"
+url_pattern = "/admin/**"
+reason = "Admin pages are not linked from public navigation"
+
+[[exclusions]]
+rule_id = "CC-SITEMAP-INDEXABILITY-003"
+url_pattern = "/legacy/*"
+reason = "Legacy pages canonicalize during migration"
+
+[diff]
+# Maximum allowed decrease in indexable URL count (percentage).
+max_indexable_url_loss_percent = 5
+
+# Maximum allowed decrease in internal link count per page (percentage).
+max_link_loss_percent = 10
+
+# Maximum allowed decrease in heading count per page (percentage).
+max_heading_loss_percent = 15
