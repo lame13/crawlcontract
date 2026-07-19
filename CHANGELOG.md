@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.2.0] - 2026-07-19
+
+### Added
+
+- Live site scanning via HTTP with `crawlcontract scan https://example.com`.
+  Supports bounded concurrency, configurable `--max-pages`, redirect chain
+  tracking, `robots.txt` crawl-delay respect, and sitemap discovery from
+  `robots.txt` sitemap directives.
+- `--max-pages` and `--concurrency` CLI flags for the `scan` subcommand.
+- Async runtime (tokio) for both static and live scanning paths.
+
 ## [0.1.0] - 2026-07-19
 
 ### Added

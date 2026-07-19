@@ -21,6 +21,7 @@ use crawlcontract::rules::orphan::OrphanRule;
 use crawlcontract::rules::registry::{self, run_all_rules, should_fail, Rule};
 use crawlcontract::rules::robots_effective::RobotsEffectiveRule;
 use crawlcontract::rules::sitemap_indexability::SitemapIndexabilityRule;
+use crawlcontract::scanner::live::{scan_live, LiveScanConfig};
 use crawlcontract::scanner::static_dir::{build_snapshot, discover_files};
 
 /// A deterministic CI gate that proves a site's crawl, canonical and
@@ -63,6 +64,14 @@ enum Commands {
         /// Path to a policy file (crawlcontract.toml) for exclusions.
         #[arg(long)]
         policy: Option<PathBuf>,
+
+        /// Maximum number of pages to fetch in live mode.
+        #[arg(long, default_value = "500")]
+        max_pages: usize,
+
+        /// Number of concurrent requests in live mode.
+        #[arg(long, default_value = "8")]
+        concurrency: usize,
     },
 
     /// Diff two snapshots and report changes.
@@ -98,32 +107,42 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let result = match cli.command {
-        Commands::Scan {
-            source,
-            public_origin,
-            snapshot,
-            format,
-            output,
-            fail_on,
-            policy,
-        } => cmd_scan(
-            source,
-            public_origin,
-            snapshot,
-            format,
-            output,
-            fail_on,
-            policy,
-        ),
-        Commands::Diff {
-            baseline,
-            candidate,
-            policy,
-            format,
-            output,
-        } => cmd_diff(baseline, candidate, policy, format, output),
-    };
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    let result = rt.block_on(async {
+        match cli.command {
+            Commands::Scan {
+                source,
+                public_origin,
+                snapshot,
+                format,
+                output,
+                fail_on,
+                policy,
+                max_pages,
+                concurrency,
+            } => {
+                cmd_scan(
+                    source,
+                    public_origin,
+                    snapshot,
+                    format,
+                    output,
+                    fail_on,
+                    policy,
+                    max_pages,
+                    concurrency,
+                )
+                .await
+            }
+            Commands::Diff {
+                baseline,
+                candidate,
+                policy,
+                format,
+                output,
+            } => cmd_diff(baseline, candidate, policy, format, output),
+        }
+    });
 
     match result {
         Ok(should_exit_error) => {
@@ -142,7 +161,8 @@ fn main() {
 }
 
 /// Returns Ok(true) if the process should exit with code 1.
-fn cmd_scan(
+#[allow(clippy::too_many_arguments)]
+async fn cmd_scan(
     source: String,
     public_origin: Option<String>,
     snapshot_path: Option<PathBuf>,
@@ -150,6 +170,8 @@ fn cmd_scan(
     output_path: Option<PathBuf>,
     fail_on: Option<String>,
     policy_path: Option<PathBuf>,
+    max_pages: usize,
+    concurrency: usize,
 ) -> anyhow::Result<bool> {
     // Load policy
     let policy = match &policy_path {
@@ -164,7 +186,23 @@ fn cmd_scan(
     let is_url = source.starts_with("http://") || source.starts_with("https://");
 
     let snapshot = if is_url {
-        anyhow::bail!("Live scanning is not yet supported. Use a static dist directory.");
+        let start_url = Url::parse(&source).with_context(|| format!("parsing URL: {source}"))?;
+        let public_origin_url = public_origin
+            .as_ref()
+            .map(|o| Url::parse(o))
+            .transpose()
+            .with_context(|| "parsing public origin")?;
+
+        let config = LiveScanConfig {
+            start_url,
+            public_origin: public_origin_url.clone(),
+            max_pages,
+            concurrency,
+            ..LiveScanConfig::default()
+        };
+
+        eprintln!("Live scanning {source} (max {max_pages} pages) ...");
+        scan_live(config).await.with_context(|| "live scanning")?
     } else {
         let dist_path = PathBuf::from(&source);
         if !dist_path.is_dir() {
