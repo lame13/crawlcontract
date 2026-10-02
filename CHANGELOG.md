@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- Update `quick-xml` to 0.41.0 and the locked `rustls` to 0.23.45 to resolve
+  RUSTSEC-2026-0194, RUSTSEC-2026-0195, and RUSTSEC-2026-0285, which failed
+  the dependency audit in CI.
+
 ## [0.4.0] - 2026-10-02
 
 This release adds baseline comparisons to scans, detailed JSON diff reports,
