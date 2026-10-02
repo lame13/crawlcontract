@@ -1,11 +1,14 @@
 pub mod canonical_consistency;
+pub mod canonical_presence;
 pub mod canonical_resolution;
 pub mod diff_rules;
 pub mod hreflang_canonical;
+pub mod hreflang_indexability;
 pub mod hreflang_reciprocal;
 pub mod internal_link_target;
 pub mod orphan;
 pub mod redirect_resolution;
 pub mod registry;
 pub mod robots_effective;
+pub mod sitemap_coverage;
 pub mod sitemap_indexability;

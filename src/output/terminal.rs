@@ -36,9 +36,14 @@ pub fn print_findings(findings: &[Finding]) {
             Severity::Warning => "WARNING".yellow().bold(),
             Severity::Info => "INFO".blue().bold(),
         };
+        let label = if group.len() == 1 {
+            "finding"
+        } else {
+            "findings"
+        };
 
         println!(
-            "\n{}  {}  ({} findings)",
+            "\n{}  {}  ({} {label})",
             rule_id.cyan(),
             severity_str,
             group.len()
@@ -76,7 +81,12 @@ pub fn print_findings(findings: &[Finding]) {
         .count();
 
     println!("{}", "═".repeat(60));
-    print!("{} findings: ", findings.len());
+    let label = if findings.len() == 1 {
+        "finding"
+    } else {
+        "findings"
+    };
+    print!("{} {label}: ", findings.len());
     if errors > 0 {
         print!("{} ", format!("{errors} error(s)").red().bold());
     }
@@ -117,4 +127,16 @@ pub fn print_statistics(snapshot: &Snapshot) {
     println!("  Redirects:       {}", snapshot.statistics.redirect_urls);
     println!("  Broken (≥400):   {}", snapshot.statistics.broken_urls);
     println!();
+}
+
+/// Print how many findings are new relative to a baseline snapshot.
+pub fn print_baseline_summary(pre_existing: usize, new: usize, total: usize) {
+    use colored::Colorize;
+
+    println!(
+        "Baseline: {} of {} finding(s) already existed; {} new.",
+        pre_existing,
+        total,
+        new.to_string().bold()
+    );
 }

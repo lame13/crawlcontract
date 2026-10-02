@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use futures_util::{stream, StreamExt};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
 use scraper::Html;
 use url::Url;
@@ -28,6 +29,7 @@ pub struct LiveScanConfig {
     pub request_timeout: Duration,
     pub user_agent: String,
     pub crawl_delay: Option<Duration>,
+    pub headers: Vec<(String, String)>,
 }
 
 impl Default for LiveScanConfig {
@@ -38,13 +40,38 @@ impl Default for LiveScanConfig {
             max_pages: 500,
             concurrency: 8,
             request_timeout: Duration::from_secs(30),
-            user_agent: format!(
-                "crawlcontract/{} (+https://github.com/lame13/crawlcontract)",
-                env!("CARGO_PKG_VERSION")
-            ),
+            user_agent: crate::scanner::default_user_agent(),
             crawl_delay: None,
+            headers: Vec::new(),
         }
     }
+}
+
+/// Build the request headers for a live scan, rejecting malformed names/values.
+pub fn build_request_headers(headers: &[(String, String)]) -> anyhow::Result<HeaderMap> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        let parsed_name = HeaderName::from_bytes(name.trim().as_bytes())
+            .with_context(|| format!("invalid header name: {name}"))?;
+        if parsed_name == reqwest::header::USER_AGENT {
+            anyhow::bail!("use --user-agent instead of a User-Agent header");
+        }
+        let parsed_value = HeaderValue::from_str(value.trim())
+            .with_context(|| format!("invalid value for header {name}"))?;
+        map.append(parsed_name, parsed_value);
+    }
+    Ok(map)
+}
+
+/// Parse a `NAME: VALUE` command-line header pair.
+pub fn parse_header_argument(raw: &str) -> anyhow::Result<(String, String)> {
+    let (name, value) = raw
+        .split_once(':')
+        .with_context(|| format!("header must use the NAME: VALUE form: {raw}"))?;
+    if name.trim().is_empty() {
+        anyhow::bail!("header name must not be empty: {raw}");
+    }
+    Ok((name.trim().to_string(), value.trim().to_string()))
 }
 
 /// Fetched result for a single URL.
@@ -75,6 +102,7 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
     let entry_url = remap_origin(&config.start_url, &crawl_origin, &base_url);
     let entry_key = normalize_url_key(&entry_url);
 
+    let request_headers = build_request_headers(&config.headers)?;
     let client = Client::builder()
         .user_agent(&config.user_agent)
         .timeout(config.request_timeout)
@@ -88,10 +116,10 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
 
     // 1. Fetch and parse robots.txt
     let robots_url = crawl_origin.join("/robots.txt").expect("valid origin URL");
-    let robots_txt = match fetch_url(&client, &robots_url).await {
-        Ok(response) if response.status == 200 => {
-            response.body.map(|body| RobotsTxt::parse(&body, &base_url))
-        }
+    let robots_txt = match fetch_url(&client, &robots_url, &crawl_origin, &request_headers).await {
+        Ok(response) if response.status == 200 => response
+            .body
+            .map(|body| RobotsTxt::parse(&body, &base_url, &config.user_agent)),
         Ok(_) => None,
         Err(error) => return Err(error).context("fetching robots.txt"),
     };
@@ -116,7 +144,7 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
 
     for sitemap_url in &sitemap_locations {
         let fetch_url_value = remap_origin(sitemap_url, &base_url, &crawl_origin);
-        match fetch_url(&client, &fetch_url_value).await {
+        match fetch_url(&client, &fetch_url_value, &crawl_origin, &request_headers).await {
             Ok(response) if response.status == 200 => {
                 if let Some(body) = &response.body {
                     let sitemap = parse_sitemap(body)
@@ -132,9 +160,14 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
                             let child_url = remap_origin(child_url, &crawl_origin, &base_url);
                             let child_fetch_url =
                                 remap_origin(&child_url, &base_url, &crawl_origin);
-                            let child_resp = fetch_url(&client, &child_fetch_url)
-                                .await
-                                .with_context(|| format!("fetching child sitemap {child_url}"))?;
+                            let child_resp = fetch_url(
+                                &client,
+                                &child_fetch_url,
+                                &crawl_origin,
+                                &request_headers,
+                            )
+                            .await
+                            .with_context(|| format!("fetching child sitemap {child_url}"))?;
                             if child_resp.status != 200 {
                                 anyhow::bail!(
                                     "child sitemap {child_url} returned HTTP {}",
@@ -246,10 +279,18 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
                 let client = client.clone();
                 let crawl_origin = crawl_origin.clone();
                 let base_url = base_url.clone();
+                let request_headers = &request_headers;
                 async move {
                     let request_url = remap_origin(&url, &base_url, &crawl_origin);
-                    let fetched =
-                        follow_redirects(&client, &request_url, 10, &crawl_origin, &base_url).await;
+                    let fetched = follow_redirects(
+                        &client,
+                        &request_url,
+                        10,
+                        &crawl_origin,
+                        &base_url,
+                        request_headers,
+                    )
+                    .await;
                     (url, fetched)
                 }
             })
@@ -428,9 +469,17 @@ pub async fn scan_live(config: LiveScanConfig) -> anyhow::Result<Snapshot> {
 }
 
 /// Fetch a URL and return the response metadata + body.
-async fn fetch_url(client: &Client, url: &Url) -> anyhow::Result<FetchedPage> {
-    let response = client
-        .get(url.as_str())
+async fn fetch_url(
+    client: &Client,
+    url: &Url,
+    crawl_origin: &Url,
+    headers: &HeaderMap,
+) -> anyhow::Result<FetchedPage> {
+    let mut request = client.get(url.as_str());
+    if url.origin() == crawl_origin.origin() {
+        request = request.headers(headers.clone());
+    }
+    let response = request
         .send()
         .await
         .with_context(|| format!("fetching {url}"))?;
@@ -470,6 +519,7 @@ async fn follow_redirects(
     max_hops: usize,
     crawl_origin: &Url,
     public_origin: &Url,
+    headers: &HeaderMap,
 ) -> anyhow::Result<FetchedPage> {
     let mut current_url = start_url.clone();
     let mut chain = vec![current_url.clone()];
@@ -479,6 +529,7 @@ async fn follow_redirects(
     loop {
         let response = client
             .get(current_url.as_str())
+            .headers(headers.clone())
             .send()
             .await
             .with_context(|| format!("fetching {current_url}"))?;
@@ -684,6 +735,19 @@ mod tests {
         fn start(
             handler: impl Fn(&str, SocketAddr) -> Option<TestResponse> + Send + 'static,
         ) -> std::io::Result<Self> {
+            Self::start_with_request(move |request, address| {
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap();
+                handler(path, address)
+            })
+        }
+
+        fn start_with_request(
+            handler: impl Fn(&str, SocketAddr) -> Option<TestResponse> + Send + 'static,
+        ) -> std::io::Result<Self> {
             let listener = TcpListener::bind("127.0.0.1:0")?;
             listener.set_nonblocking(true)?;
             let address = listener.local_addr()?;
@@ -700,16 +764,15 @@ mod tests {
                     }
                     Err(error) => panic!("accepting test connection: {error}"),
                 };
+                // Accepted sockets can inherit the listener's nonblocking mode.
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
                 let mut request = [0_u8; 4096];
                 let count = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..count]);
-                let path = request
-                    .lines()
-                    .next()
-                    .and_then(|line| line.split_whitespace().nth(1))
-                    .unwrap();
-
-                let Some(response) = handler(path, address) else {
+                let Some(response) = handler(&request, address) else {
                     continue;
                 };
                 let wire_response = format!(
@@ -759,6 +822,45 @@ mod tests {
 
         let external = Url::parse("https://external.test/path").unwrap();
         assert_eq!(remap_origin(&external, &preview, &public), external);
+    }
+
+    #[test]
+    fn user_agent_cannot_be_overridden_by_a_custom_header() {
+        let error = build_request_headers(&[("USER-agent".into(), "otherbot".into())]).unwrap_err();
+        assert!(error.to_string().contains("use --user-agent"));
+    }
+
+    #[tokio::test]
+    async fn custom_headers_stay_on_the_crawl_origin() {
+        let (tx, rx) = mpsc::channel();
+        let server = TestServer::start_with_request(move |request, _| {
+            tx.send(request.to_string()).unwrap();
+            Some(TestResponse::new("200 OK", "text/plain", "ok"))
+        })
+        .unwrap();
+        let client = Client::builder().user_agent("reviewbot").build().unwrap();
+        let headers =
+            build_request_headers(&[("Authorization".into(), "Bearer test-only".into())]).unwrap();
+        let url = server.url("/sitemap.xml");
+        fetch_url(&client, &url, &server.url("/"), &headers)
+            .await
+            .unwrap();
+        assert!(rx
+            .recv()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("authorization: bearer test-only"));
+        fetch_url(
+            &client,
+            &url,
+            &Url::parse("https://example.test").unwrap(),
+            &headers,
+        )
+        .await
+        .unwrap();
+        let external_request = rx.recv().unwrap().to_ascii_lowercase();
+        assert!(!external_request.contains("authorization:"));
+        assert!(external_request.contains("user-agent: reviewbot"));
     }
 
     #[test]

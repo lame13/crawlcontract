@@ -70,6 +70,7 @@ pub fn discover_files(dist_path: &Path, base_url: &Url) -> anyhow::Result<Static
 pub fn build_snapshot(
     result: StaticScanResult,
     public_origin: Option<Url>,
+    user_agent: &str,
 ) -> anyhow::Result<Snapshot> {
     let base_url = result.base_url.clone();
     let mut states: BTreeMap<String, UrlState> = BTreeMap::new();
@@ -78,7 +79,7 @@ pub fn build_snapshot(
     let robots_txt = result
         .robots_txt_body
         .as_deref()
-        .map(|body| crate::signals::robots_txt::RobotsTxt::parse(body, &base_url));
+        .map(|body| crate::signals::robots_txt::RobotsTxt::parse(body, &base_url, user_agent));
 
     // 2. Process sitemap
     let mut sitemap_urls = BTreeSet::new();
@@ -353,7 +354,7 @@ mod tests {
         .unwrap();
 
         let result = discover_files(&dist, &base()).unwrap();
-        let snapshot = build_snapshot(result, None).unwrap();
+        let snapshot = build_snapshot(result, None, &crate::scanner::default_user_agent()).unwrap();
 
         assert_eq!(snapshot.statistics.total_urls, 2);
         assert_eq!(snapshot.statistics.indexable_urls, 2);
@@ -372,7 +373,7 @@ mod tests {
         .unwrap();
 
         let result = discover_files(&dist, &base()).unwrap();
-        let snapshot = build_snapshot(result, None).unwrap();
+        let snapshot = build_snapshot(result, None, &crate::scanner::default_user_agent()).unwrap();
         let missing = snapshot.urls.get("https://example.test/missing").unwrap();
         assert_eq!(missing.http_status, Some(404));
         assert!(!missing.is_indexable);
@@ -387,7 +388,8 @@ mod tests {
         fs::write(dist.join("sitemap.xml"), "<urlset><url>").unwrap();
 
         let result = discover_files(&dist, &base()).unwrap();
-        let error = build_snapshot(result, None).unwrap_err();
+        let error =
+            build_snapshot(result, None, &crate::scanner::default_user_agent()).unwrap_err();
         assert!(error.to_string().contains("parsing sitemap sitemap.xml"));
     }
 }

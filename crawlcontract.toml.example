@@ -4,6 +4,8 @@
 [general]
 # Severities that cause a non-zero exit code.
 # Options: "error", "warning", "info"
+# `scan --fail-on-new` applies the same severities, but only to findings that
+# did not already exist in the --baseline snapshot.
 fail_on = ["error"]
 
 # Public origin for URL resolution. Overrides --public-origin.
@@ -19,6 +21,14 @@ reason = "Admin pages are not linked from public navigation"
 rule_id = "CC-SITEMAP-INDEXABILITY-003"
 url_pattern = "/legacy/*"
 reason = "Legacy pages canonicalize during migration"
+
+# Every rule ID in the README table can be excluded. For example, a page that
+# is intentionally absent from the sitemap:
+#
+# [[exclusions]]
+# rule_id = "CC-SITEMAP-COVERAGE-001"
+# url_pattern = "/preview/**"
+# reason = "Preview pages are intentionally left out of sitemap.xml"
 
 [diff]
 # Maximum allowed decrease in indexable URL count (percentage).

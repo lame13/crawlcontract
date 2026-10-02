@@ -1,8 +1,13 @@
+use crate::diff::engine::{DiffSummary, UrlChange};
 use crate::model::snapshot::Snapshot;
 use crate::rules::registry::{findings_summary, Finding, Severity};
 
 /// Output findings as Markdown.
-pub fn findings_to_markdown(findings: &[Finding], snapshot: &Snapshot) -> String {
+pub fn findings_to_markdown(
+    findings: &[Finding],
+    snapshot: &Snapshot,
+    diff: Option<&DiffSummary>,
+) -> String {
     let mut md = String::new();
 
     md.push_str("# CrawlContract Report\n\n");
@@ -41,6 +46,10 @@ pub fn findings_to_markdown(findings: &[Finding], snapshot: &Snapshot) -> String
         snapshot.statistics.broken_urls
     ));
     md.push('\n');
+
+    if let Some(diff) = diff {
+        md.push_str(&diff_section(diff));
+    }
 
     if findings.is_empty() {
         md.push_str("## Findings\n\n");
@@ -108,4 +117,60 @@ pub fn findings_to_markdown(findings: &[Finding], snapshot: &Snapshot) -> String
     }
 
     md
+}
+
+/// Render the baseline comparison as a Markdown section.
+fn diff_section(diff: &DiffSummary) -> String {
+    let mut md = String::new();
+
+    let delta = diff.indexable_candidate as i64 - diff.indexable_baseline as i64;
+    md.push_str("## Baseline Comparison\n\n");
+    md.push_str(&format!(
+        "Indexable URLs: **{} → {}** ({delta:+})\n\n",
+        diff.indexable_baseline, diff.indexable_candidate
+    ));
+
+    if !diff.lost_urls.is_empty() {
+        md.push_str(&format!("### Lost URLs ({})\n\n", diff.lost_urls.len()));
+        for url in &diff.lost_urls {
+            md.push_str(&format!("- `{url}`\n"));
+        }
+        md.push('\n');
+    }
+
+    if !diff.gained_urls.is_empty() {
+        md.push_str(&format!("### Gained URLs ({})\n\n", diff.gained_urls.len()));
+        for url in &diff.gained_urls {
+            md.push_str(&format!("- `{url}`\n"));
+        }
+        md.push('\n');
+    }
+
+    if !diff.changed_urls.is_empty() {
+        md.push_str(&format!(
+            "### Changed URLs ({})\n\n",
+            diff.changed_urls.len()
+        ));
+        for (url, changes) in &diff.changed_urls {
+            md.push_str(&format!("- `{url}`\n"));
+            for change in changes {
+                md.push_str(&format!("  - {}\n", describe_change(change)));
+            }
+        }
+        md.push('\n');
+    }
+
+    md
+}
+
+fn describe_change(change: &UrlChange) -> String {
+    match change {
+        UrlChange::CanonicalChanged { from, to } => {
+            format!("canonical: {from:?} → {to:?}")
+        }
+        UrlChange::IndexChanged { from, to } => format!("indexable: {from} → {to}"),
+        UrlChange::RobotsChanged => "robots directive changed".to_string(),
+        UrlChange::WordCountChanged { from, to } => format!("words: {from:?} → {to:?}"),
+        UrlChange::LinkCountChanged { from, to } => format!("links: {from} → {to}"),
+    }
 }

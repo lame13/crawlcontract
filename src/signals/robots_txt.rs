@@ -6,10 +6,15 @@ use crate::model::url_state::RobotsTxtStatus;
 /// A parsed robots.txt with rules for a specific user-agent.
 #[derive(Debug, Clone)]
 pub struct RobotsTxt {
-    /// Wildcard-agent rules evaluated with most-specific-match-wins semantics.
+    /// Rules from the group that applies to [`Self::user_agent`], evaluated with
+    /// most-specific-match-wins semantics.
     rules: Vec<RobotsRule>,
     pub crawl_delay: Option<f64>,
     pub sitemaps: Vec<Url>,
+    /// The user-agent string this parse was evaluated for.
+    pub user_agent: String,
+    /// The `User-agent` group that was selected, or `*` when no group matched.
+    pub matched_agent: String,
 }
 
 #[derive(Debug, Clone)]
@@ -20,11 +25,16 @@ struct RobotsRule {
 }
 
 impl RobotsTxt {
-    /// Parse a robots.txt body. `base_url` is used to resolve relative sitemap URLs.
-    pub fn parse(body: &str, base_url: &Url) -> Self {
-        let mut all_rules: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+    /// Parse a robots.txt body for `user_agent`.
+    ///
+    /// `base_url` is used to resolve relative sitemap URLs. Rule groups are
+    /// selected by the longest case-insensitive token match against
+    /// `user_agent`, and the `*`
+    /// group is the fallback when no group names this agent.
+    pub fn parse(body: &str, base_url: &Url, user_agent: &str) -> Self {
+        let mut groups: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+        let mut delays: BTreeMap<String, f64> = BTreeMap::new();
         let mut current_agents: Vec<String> = Vec::new();
-        let mut crawl_delay: Option<f64> = None;
         let mut sitemaps = Vec::new();
         let mut directives_started = false;
 
@@ -49,18 +59,25 @@ impl RobotsTxt {
             match key.as_str() {
                 "user-agent" => {
                     let agent = value.to_lowercase();
+                    let agent = agent.trim();
+                    if agent.is_empty() {
+                        continue;
+                    }
                     if directives_started {
                         current_agents.clear();
                         directives_started = false;
                     }
-                    current_agents.push(agent.clone());
-                    all_rules.entry(agent).or_default();
+                    current_agents.push(agent.to_string());
+                    // Register the group even when it carries no rules: matching
+                    // an empty group means "no restrictions" rather than
+                    // falling back to the wildcard group.
+                    groups.entry(agent.to_string()).or_default();
                 }
                 "disallow" => {
                     directives_started = true;
                     if !value.is_empty() {
                         for agent in &current_agents {
-                            all_rules
+                            groups
                                 .entry(agent.clone())
                                 .or_default()
                                 .push((value.clone(), false));
@@ -71,7 +88,7 @@ impl RobotsTxt {
                     directives_started = true;
                     if !value.is_empty() {
                         for agent in &current_agents {
-                            all_rules
+                            groups
                                 .entry(agent.clone())
                                 .or_default()
                                 .push((value.clone(), true));
@@ -85,11 +102,14 @@ impl RobotsTxt {
                 }
                 "crawl-delay" => {
                     directives_started = true;
-                    if current_agents.iter().any(|agent| agent == "*") {
-                        crawl_delay = value
-                            .parse::<f64>()
-                            .ok()
-                            .filter(|delay| delay.is_finite() && *delay >= 0.0);
+                    if let Some(seconds) = value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|delay| delay.is_finite() && *delay >= 0.0)
+                    {
+                        for agent in &current_agents {
+                            delays.insert(agent.clone(), seconds);
+                        }
                     }
                 }
                 _ => {
@@ -100,8 +120,9 @@ impl RobotsTxt {
             }
         }
 
-        // Use wildcard rules if present, otherwise empty.
-        let rules = all_rules.remove("*").unwrap_or_default();
+        let matched_agent = select_group(&groups, user_agent);
+        let rules = groups.remove(&matched_agent).unwrap_or_default();
+        let crawl_delay = delays.get(&matched_agent).copied();
 
         let rules = rules
             .into_iter()
@@ -120,10 +141,12 @@ impl RobotsTxt {
             rules,
             crawl_delay,
             sitemaps,
+            user_agent: user_agent.to_string(),
+            matched_agent,
         }
     }
 
-    /// Evaluate whether a URL path is allowed for the wildcard user-agent.
+    /// Evaluate whether a URL path is allowed for the configured user-agent.
     pub fn is_allowed(&self, path: &str) -> RobotsTxtStatus {
         let mut best: Option<(usize, bool)> = None;
 
@@ -149,6 +172,27 @@ impl RobotsTxt {
             None => RobotsTxtStatus::NoRule,
         }
     }
+}
+
+/// Pick the rule group that applies to `user_agent`.
+///
+/// The longest `User-agent` token contained in the crawler's user-agent string
+/// wins; `*` is used when no named group matches.
+fn select_group(groups: &BTreeMap<String, Vec<(String, bool)>>, user_agent: &str) -> String {
+    let haystack = user_agent.to_lowercase();
+    let mut best: Option<&str> = None;
+
+    for agent in groups.keys() {
+        if agent == "*" || agent.is_empty() || !haystack.contains(agent.as_str()) {
+            continue;
+        }
+        best = match best {
+            Some(current) if current.len() >= agent.len() => Some(current),
+            _ => Some(agent.as_str()),
+        };
+    }
+
+    best.unwrap_or("*").to_string()
 }
 
 fn robots_pattern_matches(pattern: &str, path: &str) -> bool {
@@ -214,6 +258,20 @@ mod tests {
         Url::parse("https://example.test").unwrap()
     }
 
+    /// Parse with the default crawlcontract user-agent.
+    fn parse(body: &str) -> RobotsTxt {
+        RobotsTxt::parse(
+            body,
+            &base(),
+            "crawlcontract/0.4.0 (+https://example.test/bot)",
+        )
+    }
+
+    /// Parse as an arbitrary user-agent.
+    fn parse_as(body: &str, user_agent: &str) -> RobotsTxt {
+        RobotsTxt::parse(body, &base(), user_agent)
+    }
+
     #[test]
     fn parse_simple() {
         let body = r#"
@@ -222,8 +280,9 @@ Disallow: /admin/
 Allow: /admin/login
 Sitemap: https://example.test/sitemap.xml
 "#;
-        let rt = RobotsTxt::parse(body, &base());
+        let rt = parse(body);
         assert_eq!(rt.sitemaps.len(), 1);
+        assert_eq!(rt.matched_agent, "*");
         assert_eq!(rt.is_allowed("/public/page"), RobotsTxtStatus::NoRule);
         assert_eq!(rt.is_allowed("/admin/secret"), RobotsTxtStatus::Blocked);
         assert_eq!(rt.is_allowed("/admin/login"), RobotsTxtStatus::Allowed);
@@ -231,7 +290,7 @@ Sitemap: https://example.test/sitemap.xml
 
     #[test]
     fn empty_robots_txt() {
-        let rt = RobotsTxt::parse("", &base());
+        let rt = parse("");
         assert_eq!(rt.is_allowed("/anything"), RobotsTxtStatus::NoRule);
     }
 
@@ -242,7 +301,7 @@ User-agent: *
 Disallow: /
 Allow: /public/
 "#;
-        let rt = RobotsTxt::parse(body, &base());
+        let rt = parse(body);
         assert_eq!(rt.is_allowed("/secret"), RobotsTxtStatus::Blocked);
         assert_eq!(rt.is_allowed("/public/page"), RobotsTxtStatus::Allowed);
     }
@@ -250,14 +309,14 @@ Allow: /public/
     #[test]
     fn allow_wins_when_match_lengths_are_equal() {
         let body = "User-agent: *\nDisallow: /page\nAllow: /page";
-        let rt = RobotsTxt::parse(body, &base());
+        let rt = parse(body);
         assert_eq!(rt.is_allowed("/page"), RobotsTxtStatus::Allowed);
     }
 
     #[test]
     fn supports_wildcards_end_anchors_and_queries() {
         let body = "User-agent: *\nDisallow: /*?preview=*$\nDisallow: /*.pdf$";
-        let rt = RobotsTxt::parse(body, &base());
+        let rt = parse(body);
         assert_eq!(
             rt.is_allowed("/page?preview=true"),
             RobotsTxtStatus::Blocked
@@ -272,20 +331,78 @@ Allow: /public/
     #[test]
     fn user_agent_after_directives_starts_a_new_group() {
         let body = "User-agent: *\nDisallow: /private\nUser-agent: otherbot\nDisallow: /public";
-        let rt = RobotsTxt::parse(body, &base());
+        let rt = parse(body);
+        assert_eq!(rt.matched_agent, "*");
         assert_eq!(rt.is_allowed("/private"), RobotsTxtStatus::Blocked);
         assert_eq!(rt.is_allowed("/public"), RobotsTxtStatus::NoRule);
     }
 
     #[test]
     fn anchored_wildcard_can_backtrack_to_the_last_match() {
-        let rt = RobotsTxt::parse("User-agent: *\nDisallow: /foo*bar$", &base());
+        let rt = parse("User-agent: *\nDisallow: /foo*bar$");
         assert_eq!(rt.is_allowed("/foobarbazbar"), RobotsTxtStatus::Blocked);
     }
 
     #[test]
     fn invalid_crawl_delay_is_ignored() {
-        let rt = RobotsTxt::parse("User-agent: *\nCrawl-delay: -1", &base());
+        let rt = parse("User-agent: *\nCrawl-delay: -1");
+        assert!(rt.crawl_delay.is_none());
+    }
+
+    #[test]
+    fn named_group_replaces_the_wildcard_group_for_a_matching_agent() {
+        let body = "User-agent: *\nDisallow: /private\n\n\
+                    User-agent: crawlcontract\nDisallow: /for-crawlcontract-only";
+        let rt = parse(body);
+        assert_eq!(rt.matched_agent, "crawlcontract");
+        // The named group applies, so the wildcard rule does not.
+        assert_eq!(rt.is_allowed("/private"), RobotsTxtStatus::NoRule);
+        assert_eq!(
+            rt.is_allowed("/for-crawlcontract-only"),
+            RobotsTxtStatus::Blocked
+        );
+
+        // A different crawler still falls back to the wildcard group.
+        let other = parse_as(body, "Googlebot/2.1");
+        assert_eq!(other.matched_agent, "*");
+        assert_eq!(other.is_allowed("/private"), RobotsTxtStatus::Blocked);
+        assert_eq!(
+            other.is_allowed("/for-crawlcontract-only"),
+            RobotsTxtStatus::NoRule
+        );
+    }
+
+    #[test]
+    fn longest_matching_agent_token_wins() {
+        let body = "User-agent: crawl\nDisallow: /short\n\n\
+                    User-agent: crawlcontract\nDisallow: /long";
+        let rt = parse(body);
+        assert_eq!(rt.matched_agent, "crawlcontract");
+        assert_eq!(rt.is_allowed("/long"), RobotsTxtStatus::Blocked);
+        // The shorter token's group must not leak into the longer one.
+        assert_eq!(rt.is_allowed("/short"), RobotsTxtStatus::NoRule);
+    }
+
+    #[test]
+    fn empty_named_group_does_not_inherit_wildcard_rules() {
+        let body = "User-agent: *\nDisallow: /\n\nUser-agent: crawlcontract";
+        let rt = parse(body);
+        assert_eq!(rt.matched_agent, "crawlcontract");
+        assert_eq!(rt.is_allowed("/anything"), RobotsTxtStatus::NoRule);
+    }
+
+    #[test]
+    fn crawl_delay_comes_from_the_matched_group() {
+        let body = "User-agent: *\nCrawl-delay: 1\n\nUser-agent: crawlcontract\nCrawl-delay: 3";
+        assert_eq!(parse(body).crawl_delay, Some(3.0));
+        assert_eq!(parse_as(body, "Googlebot").crawl_delay, Some(1.0));
+    }
+
+    #[test]
+    fn group_without_crawl_delay_does_not_inherit_the_wildcard_delay() {
+        let body = "User-agent: *\nCrawl-delay: 5\n\nUser-agent: crawlcontract\nDisallow: /x";
+        let rt = parse(body);
+        assert_eq!(rt.matched_agent, "crawlcontract");
         assert!(rt.crawl_delay.is_none());
     }
 }

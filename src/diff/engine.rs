@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use crate::model::snapshot::Snapshot;
 
 /// Compare two snapshots and return a human-readable summary of changes.
@@ -80,7 +82,7 @@ pub fn diff_snapshots(baseline: &Snapshot, candidate: &Snapshot) -> DiffSummary 
     summary
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct DiffSummary {
     pub indexable_baseline: usize,
     pub indexable_candidate: usize,
@@ -89,7 +91,8 @@ pub struct DiffSummary {
     pub changed_urls: Vec<(String, Vec<UrlChange>)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UrlChange {
     CanonicalChanged {
         from: Option<String>,

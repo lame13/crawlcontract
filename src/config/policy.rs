@@ -81,31 +81,6 @@ fn default_max_heading_loss() -> f64 {
     15.0
 }
 
-const EXCLUDABLE_RULE_IDS: &[&str] = &[
-    "CC-CANONICAL-CONSISTENCY-001",
-    "CC-CANONICAL-CONSISTENCY-003",
-    "CC-CANONICAL-CONSISTENCY-004",
-    "CC-CANONICAL-RESOLUTION-001",
-    "CC-CANONICAL-RESOLUTION-002",
-    "CC-DIFF-LOSS-CONTENT",
-    "CC-DIFF-LOSS-INDEXABLE",
-    "CC-DIFF-LOSS-LINKS",
-    "CC-HREFLANG-CANONICAL-001",
-    "CC-HREFLANG-RECIPROCAL-001",
-    "CC-HREFLANG-RECIPROCAL-002",
-    "CC-LINK-TARGET-001",
-    "CC-LINK-TARGET-002",
-    "CC-LINK-TARGET-003",
-    "CC-LINK-TARGET-004",
-    "CC-ORPHAN-001",
-    "CC-REDIRECT-RESOLUTION-001",
-    "CC-ROBOTS-EFFECTIVE-001",
-    "CC-SITEMAP-INDEXABILITY-001",
-    "CC-SITEMAP-INDEXABILITY-002",
-    "CC-SITEMAP-INDEXABILITY-003",
-    "CC-SITEMAP-INDEXABILITY-004",
-];
-
 impl Policy {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -132,7 +107,7 @@ impl Policy {
         }
 
         for (index, exclusion) in self.exclusions.iter().enumerate() {
-            if !EXCLUDABLE_RULE_IDS.contains(&exclusion.rule_id.as_str()) {
+            if !crate::rules::registry::is_finding_rule(&exclusion.rule_id) {
                 anyhow::bail!(
                     "exclusions[{index}].rule_id is not a known finding rule: {}",
                     exclusion.rule_id

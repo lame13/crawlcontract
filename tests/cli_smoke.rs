@@ -9,6 +9,22 @@ fn fixture_path(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Scan a fixture into a snapshot file.
+fn write_snapshot(fixture: &str, path: &std::path::Path) {
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path(fixture),
+            "--public-origin",
+            "https://example.test",
+            "--snapshot",
+            path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
 #[test]
 fn scan_basic_site_exits_clean() {
     Command::cargo_bin("crawlcontract")
@@ -188,7 +204,313 @@ fn version_flag() {
         .args(["--version"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("crawlcontract 0.3.1"));
+        .stdout(predicate::str::contains(format!(
+            "crawlcontract {}",
+            env!("CARGO_PKG_VERSION")
+        )));
+}
+
+#[test]
+fn scan_with_baseline_emits_a_diff_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let baseline = temp.path().join("baseline.json");
+    write_snapshot("basic-site", &baseline);
+
+    // The scan itself gates the regression (exit 1) and still reports the full
+    // baseline comparison in the JSON payload.
+    let assert = Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("orphan-pages"),
+            "--public-origin",
+            "https://example.test",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(report["command"], "scan");
+    assert_eq!(
+        report["diff"]["baseline"]["base_url"],
+        "https://example.test/"
+    );
+    assert!(report["diff"]["gained_urls"].is_array());
+    assert!(report["diff"]["counts"]["gained"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn fail_on_new_ignores_findings_that_already_existed() {
+    let temp = tempfile::tempdir().unwrap();
+    let baseline = temp.path().join("baseline.json");
+    // This fixture has one CC-SITEMAP-COVERAGE-001 warning.
+    write_snapshot("coverage-gap", &baseline);
+
+    // Without a baseline, failing on warnings trips on the pre-existing one.
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("coverage-gap"),
+            "--public-origin",
+            "https://example.test",
+            "--fail-on",
+            "warning",
+        ])
+        .assert()
+        .code(1);
+
+    // Against the baseline, the same finding is not new, so the gate passes.
+    let assert = Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("coverage-gap"),
+            "--public-origin",
+            "https://example.test",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--fail-on-new",
+            "--fail-on",
+            "warning",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(report["summary"]["new"], 0);
+    assert_eq!(report["summary"]["total"], 1);
+    assert_eq!(report["findings"][0]["new"], false);
+}
+
+#[test]
+fn fail_on_new_gates_a_regression_introduced_since_the_baseline() {
+    let temp = tempfile::tempdir().unwrap();
+    let baseline = temp.path().join("baseline.json");
+    write_snapshot("basic-site", &baseline);
+
+    let assert = Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("sitemap-conflict"),
+            "--public-origin",
+            "https://example.test",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--fail-on-new",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(report["summary"]["new"].as_u64().unwrap() > 0);
+}
+
+#[test]
+fn fail_on_new_requires_a_baseline() {
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args(["scan", &fixture_path("basic-site"), "--fail-on-new"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--baseline"));
+}
+
+#[test]
+fn fail_on_new_distinguishes_hreflang_targets_on_the_same_page() {
+    let temp = tempfile::tempdir().unwrap();
+    let site = temp.path().join("site");
+    fs::create_dir(&site).unwrap();
+    let baseline = temp.path().join("baseline.json");
+    let old = "<link rel=\"alternate\" hreflang=\"es\" href=\"/es\">";
+    let new = "<link rel=\"alternate\" hreflang=\"fr\" href=\"/fr\">";
+    fs::write(site.join("index.html"), old).unwrap();
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            site.to_str().unwrap(),
+            "--snapshot",
+            baseline.to_str().unwrap(),
+        ])
+        .assert()
+        .code(1);
+
+    fs::write(site.join("index.html"), format!("{old}{new}")).unwrap();
+    let assert = Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            site.to_str().unwrap(),
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--fail-on-new",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .code(1);
+    let report: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    let findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule_id"] == "CC-HREFLANG-RECIPROCAL-001")
+        .collect();
+    assert_eq!(findings.len(), 2);
+    for finding in findings {
+        let is_french = finding["evidence"]["declared"]
+            .as_str()
+            .unwrap()
+            .contains("fr →");
+        assert_eq!(finding["new"], is_french);
+    }
+}
+
+#[test]
+fn diff_json_lists_lost_and_gained_urls() {
+    let temp = tempfile::tempdir().unwrap();
+    let baseline = temp.path().join("baseline.json");
+    let candidate = temp.path().join("candidate.json");
+    write_snapshot("basic-site", &baseline);
+    write_snapshot("orphan-pages", &candidate);
+
+    let assert = Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "diff",
+            baseline.to_str().unwrap(),
+            candidate.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        // The regression found by the diff is what makes the command exit 1.
+        .code(1);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert_eq!(report["command"], "diff");
+    assert_eq!(report["diff"]["counts"]["lost"].as_u64().unwrap(), 3);
+    assert_eq!(report["diff"]["indexable_urls"]["baseline"], 4);
+    assert_eq!(report["diff"]["indexable_urls"]["candidate"], 3);
+    assert_eq!(report["diff"]["indexable_urls"]["delta"], -1);
+    let lost = report["diff"]["lost_urls"].as_array().unwrap();
+    assert!(lost
+        .iter()
+        .any(|url| url.as_str().unwrap().ends_with("/about")));
+}
+
+#[test]
+fn diff_honours_fail_on_severity() {
+    let temp = tempfile::tempdir().unwrap();
+    let baseline = temp.path().join("baseline.json");
+    let candidate = temp.path().join("candidate.json");
+    write_snapshot("basic-site", &baseline);
+    write_snapshot("orphan-pages", &candidate);
+
+    // A diff with no findings passes even when warnings gate the build.
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "diff",
+            baseline.to_str().unwrap(),
+            baseline.to_str().unwrap(),
+            "--fail-on",
+            "warning",
+        ])
+        .assert()
+        .success();
+
+    // A real regression fails the gate.
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "diff",
+            baseline.to_str().unwrap(),
+            candidate.to_str().unwrap(),
+            "--fail-on",
+            "warning",
+        ])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn scan_rejects_malformed_headers() {
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("basic-site"),
+            "--header",
+            "not-a-header",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "header must use the NAME: VALUE form",
+        ));
+}
+
+#[test]
+fn scan_rejects_invalid_live_tuning_flags() {
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args(["scan", &fixture_path("basic-site"), "--timeout", "0"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "--timeout must be greater than zero",
+        ));
+
+    Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args(["scan", &fixture_path("basic-site"), "--crawl-delay=-1"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid --crawl-delay value"));
+}
+
+#[test]
+fn markdown_report_includes_the_baseline_comparison() {
+    let temp = tempfile::tempdir().unwrap();
+    let baseline = temp.path().join("baseline.json");
+    write_snapshot("basic-site", &baseline);
+
+    // The report is still produced on the way to the failing exit code.
+    let assert = Command::cargo_bin("crawlcontract")
+        .unwrap()
+        .args([
+            "scan",
+            &fixture_path("orphan-pages"),
+            "--public-origin",
+            "https://example.test",
+            "--baseline",
+            baseline.to_str().unwrap(),
+            "--format",
+            "markdown",
+        ])
+        .assert()
+        .code(1);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("## Baseline Comparison"));
+    assert!(stdout.contains("### Lost URLs"));
 }
 
 #[test]

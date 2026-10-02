@@ -4,6 +4,78 @@ All notable changes to this project will be documented in this file.
 
 The project uses semantic versioning.
 
+## [0.4.0] - 2026-10-02
+
+This release adds baseline comparisons to scans, detailed JSON diff reports,
+and new canonical, sitemap coverage, and hreflang indexability checks.
+
+### Added
+
+- Baseline-native scans. `scan --baseline SNAPSHOT` runs the `CC-DIFF-LOSS-*`
+  rules alongside the normal rule set and reports lost, gained, and changed
+  URLs in terminal, JSON, and Markdown reports.
+- `scan --fail-on-new`, which exits `1` only for findings the baseline scan does
+  not already contain. Findings are computed by running the same rule set
+  against the baseline, so "new" means new since that baseline rather than new
+  since the installed tool version.
+- JSON diff payloads. `json` output now includes a `diff` object with
+  `lost_urls`, `gained_urls`, `changed_urls`, per-URL change details,
+  `counts`, `indexable_urls` (baseline, candidate, delta), and baseline
+  provenance. Previously `diff --format json` emitted only findings, so the URL
+  lists never reached a machine-readable consumer.
+- Findings are marked `"new": true` or `"new": false` in JSON output from
+  `scan --baseline`.
+- `CC-SITEMAP-COVERAGE-001`: an indexable, verified HTML page is missing from
+  every sitemap. This is the inverse of the sitemap indexability family, which
+  only checked declared URLs. Scans with no sitemap data are out of scope.
+- `CC-CANONICAL-PRESENCE-001`: an indexable page declares no canonical in HTML
+  or in the HTTP `Link` header. The existing canonical rules only compared
+  canonicals that existed. Both this rule and `CC-SITEMAP-COVERAGE-001` only
+  consider responses that were parsed as HTML, so a `200` response for an
+  image, stylesheet, or font is never reported as a page without a canonical.
+- `CC-HREFLANG-INDEXABILITY-001`: an hreflang target returns a non-`200` status,
+  is blocked by `robots.txt`, or carries `noindex`. Robots-blocked targets are
+  reported even when they cannot be fetched. Canonical mismatches stay with
+  `CC-HREFLANG-CANONICAL-001`.
+- Live scan flags: `--user-agent`, `--header NAME: VALUE` (repeatable),
+  `--timeout`, and `--crawl-delay`. Custom headers are restricted to the crawl
+  origin; use `--user-agent` to set the crawler identity consistently.
+- A rule catalog in `rules::registry` as the single source of truth for policy
+  validation and SARIF rule metadata.
+- `diff --fail-on` for parity with `scan`.
+- A baseline comparison section in Markdown reports.
+- crates.io metadata plus a `crates-io` release job that publishes on version
+  tags when `CARGO_REGISTRY_TOKEN` is configured.
+- CI now runs `cargo audit` on pushes and on a weekly schedule, verifies that
+  `VERSION` matches `Cargo.toml`, runs `cargo package --locked`, and tests on
+  macOS in addition to Linux and Windows.
+
+### Changed
+
+- `robots.txt` groups are selected by the configured user-agent: the longest
+  `User-agent` token contained in the crawler's user-agent string wins, with
+  `*` as the fallback. `Crawl-delay` is read from the matched group.
+- Static scans evaluate `robots.txt` for the configured user agent instead of
+  the wildcard group only.
+- SARIF results carry catalog descriptions, a `helpUri`, a `detail` property,
+  and `partialFingerprints` so consumers can track one finding across runs.
+- Library API: `RobotsTxt::parse` and `static_dir::build_snapshot` take a
+  user-agent argument; `findings_to_markdown` takes an optional diff summary;
+  `LiveScanConfig` includes a `headers` field.
+
+### Fixed
+
+- Baseline comparisons and SARIF fingerprints distinguish separate declared
+  targets on the same page, so a pre-existing finding cannot mask a new target
+  failure with the same rule ID.
+- Named `User-agent` groups were parsed and then discarded, so a site that
+  restricted a specific crawler by name or listed `crawlcontract` explicitly
+  was evaluated against the wrong rules.
+- `Crawl-delay` was ignored unless it appeared in the `User-agent: *` group.
+- Policy exclusions now validate against the rule catalog rather than a
+  hand-maintained list of rule IDs, so a newly added rule cannot silently
+  become unexcludable.
+
 ## [0.3.1] - 2026-07-19
 
 ### Fixed

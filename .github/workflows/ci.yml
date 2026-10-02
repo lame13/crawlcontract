@@ -5,6 +5,10 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  schedule:
+    # Re-audit dependencies weekly so new advisories surface without a push.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,11 +46,45 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify VERSION matches Cargo.toml
+        shell: bash
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          manifest="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          if [ "$version" != "$manifest" ]; then
+            echo "VERSION ($version) does not match Cargo.toml ($manifest)" >&2
+            exit 1
+          fi
+      - run: cargo package --locked
+
+  audit:
+    name: Audit
+    # Fork pull requests only receive a read-only token, and an advisory in a
+    # dependency is not something a contributor can fix in the pull request.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   clippy:
     name: Clippy

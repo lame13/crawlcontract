@@ -1,6 +1,8 @@
 use serde_json::json;
 
-use crate::rules::registry::{Finding, Severity};
+use crate::rules::registry::{rule_metadata, Finding, Severity};
+
+const RULES_URI: &str = "https://github.com/lame13/crawlcontract#rules";
 
 /// Serialize findings as SARIF 2.1.0 format.
 pub fn findings_to_sarif(findings: &[Finding]) -> anyhow::Result<String> {
@@ -10,14 +12,20 @@ pub fn findings_to_sarif(findings: &[Finding]) -> anyhow::Result<String> {
             .iter()
             .filter(|f| seen.insert(&f.rule_id))
             .map(|f| {
+                let metadata = rule_metadata(&f.rule_id);
                 json!({
                     "id": f.rule_id,
                     "name": f.rule_id,
                     "shortDescription": {
-                        "text": f.message
+                        "text": metadata
+                            .map(|rule| rule.description)
+                            .unwrap_or(f.message.as_str())
                     },
+                    "helpUri": RULES_URI,
                     "defaultConfiguration": {
-                        "level": severity_to_sarif_level(f.severity)
+                        "level": severity_to_sarif_level(
+                            metadata.map(|rule| rule.severity).unwrap_or(f.severity)
+                        )
                     }
                 })
             })
@@ -39,22 +47,29 @@ pub fn findings_to_sarif(findings: &[Finding]) -> anyhow::Result<String> {
                             "uri": f.url
                         }
                     }
-                }]
+                }],
+                // Stable per-run identity so consumers such as GitHub code
+                // scanning can track one finding across runs.
+                "partialFingerprints": {
+                    "crawlcontractFindingKey": json!(f.key()).to_string()
+                },
+                "properties": {
+                    "ruleId": f.rule_id,
+                    "severity": f.severity.to_string()
+                }
             });
 
-            // Add properties for evidence
-            let mut props = serde_json::Map::new();
             if let Some(ref declared) = f.evidence.declared {
-                props.insert("declared".to_string(), json!(declared));
+                result["properties"]["declared"] = json!(declared);
             }
             if let Some(ref observed) = f.evidence.observed {
-                props.insert("observed".to_string(), json!(observed));
+                result["properties"]["observed"] = json!(observed);
             }
             if let Some(ref canonical) = f.evidence.canonical {
-                props.insert("canonical".to_string(), json!(canonical));
+                result["properties"]["canonical"] = json!(canonical);
             }
-            if !props.is_empty() {
-                result["properties"] = json!(props);
+            if let Some(ref detail) = f.evidence.detail {
+                result["properties"]["detail"] = json!(detail);
             }
 
             result
